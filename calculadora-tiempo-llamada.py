@@ -26,11 +26,34 @@ ONE_DAY_SECONDS = 86400
 
 
 def adjust_creation_time(ts: pd.Timestamp) -> pd.Timestamp:
-    """Si el lead se crea antes de WORK_START_HOUR, ajusta a esa hora."""
+    """Ajusta la fecha de creación al horario operativo:
+    - lunes a viernes: desde las 09:00
+    - sábado: desde las 09:00 hasta las 18:00
+    - domingo: pasa al lunes a las 09:00
+    """
     if pd.isna(ts):
         return ts
-    if ts.hour < WORK_START_HOUR:
-        return ts.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
+
+    # Domingo -> lunes 09:00
+    if ts.weekday() == 6:
+        next_monday = ts + pd.Timedelta(days=1)
+        return next_monday.replace(hour=9, minute=0, second=0, microsecond=0)
+
+    # Sábado
+    if ts.weekday() == 5:
+        # Antes de las 09:00 -> sábado 09:00
+        if ts.hour < 9:
+            return ts.replace(hour=9, minute=0, second=0, microsecond=0)
+        # A partir de las 18:00 -> lunes 09:00
+        if ts.hour >= 18:
+            next_monday = ts + pd.Timedelta(days=2)
+            return next_monday.replace(hour=9, minute=0, second=0, microsecond=0)
+        return ts
+
+    # Lunes a viernes
+    if ts.hour < 9:
+        return ts.replace(hour=9, minute=0, second=0, microsecond=0)
+
     return ts
 
 
