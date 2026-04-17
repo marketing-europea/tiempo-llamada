@@ -338,7 +338,12 @@ def compute_first_outbound_call(df: pd.DataFrame, apply_filter_1day: bool):
     df[COL_SUBJECT] = df[COL_SUBJECT].astype(str).str.strip()
 
     df = df.dropna(subset=[COL_DEAL_ID, COL_CREATED, COL_DUE_DATE, COL_SUBJECT]).copy()
+    if contact_mode == "Primera llamada saliente":
     df = df[df[COL_SUBJECT].str.contains("llamada saliente", case=False, na=False)].copy()
+    else:
+    df = df[
+        df[COL_SUBJECT].str.contains("llamada saliente|whatsapp chat", case=False, na=False)
+    ].copy()
 
     # El agente que llama
     df["call_owner"] = df[COL_OWNER]
