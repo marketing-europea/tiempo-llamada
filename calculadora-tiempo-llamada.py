@@ -72,6 +72,8 @@ def compute_first_outbound_call(df: pd.DataFrame):
     # Solo actividades posteriores o iguales a la creación ajustada
     df = df[df["delta_sec"] >= 0].copy()
 
+    df = df[df["delta_sec"] <= 86400].copy()
+
     # Orden cronológico por lead
     df = df.sort_values([COL_DEAL_ID, COL_DUE_DATE, COL_SUBJECT]).copy()
 
