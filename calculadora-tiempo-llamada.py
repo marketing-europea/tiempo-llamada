@@ -2,6 +2,78 @@ import io
 import pandas as pd
 import streamlit as st
 
+import pandas as pd
+
+WORK_START_HOUR = 9
+SATURDAY_END_HOUR = 18
+
+HOLIDAYS_2026 = {
+    pd.Timestamp("2026-01-01").date(),  # Año Nuevo
+    pd.Timestamp("2026-01-06").date(),  # Epifanía del Señor
+    pd.Timestamp("2026-04-03").date(),  # Viernes Santo
+    pd.Timestamp("2026-05-01").date(),  # Fiesta del Trabajo
+    pd.Timestamp("2026-08-15").date(),  # Asunción de la Virgen
+    pd.Timestamp("2026-10-12").date(),  # Fiesta Nacional de España
+    pd.Timestamp("2026-11-01").date(),  # Todos los Santos
+    pd.Timestamp("2026-12-08").date(),  # Inmaculada Concepción
+    pd.Timestamp("2026-12-25").date(),  # Navidad
+}
+
+
+def is_holiday(ts: pd.Timestamp) -> bool:
+    return ts.date() in HOLIDAYS_2026
+
+
+def is_non_working_day(ts: pd.Timestamp) -> bool:
+    # domingo o festivo
+    return ts.weekday() == 6 or is_holiday(ts)
+
+
+def next_valid_workday_start(ts: pd.Timestamp) -> pd.Timestamp:
+    """
+    Mueve la fecha al siguiente día laborable a las 09:00.
+    Considera domingos y festivos.
+    """
+    ts = ts.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
+
+    while ts.weekday() == 6 or is_holiday(ts):
+        ts = ts + pd.Timedelta(days=1)
+        ts = ts.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
+
+    return ts
+
+
+def adjust_creation_time(ts: pd.Timestamp) -> pd.Timestamp:
+    """
+    Ajusta la creación al horario operativo:
+    - lunes a viernes: desde las 09:00
+    - sábado: desde las 09:00 hasta las 18:00
+    - domingo: pasa al siguiente laborable a las 09:00
+    - festivo: pasa al siguiente laborable a las 09:00
+    """
+    if pd.isna(ts):
+        return ts
+
+    # Domingo o festivo -> siguiente laborable 09:00
+    if is_non_working_day(ts):
+        next_day = ts + pd.Timedelta(days=1)
+        return next_valid_workday_start(next_day)
+
+    # Sábado
+    if ts.weekday() == 5:
+        # Si además fuese festivo, ya habría entrado arriba
+        if ts.hour < WORK_START_HOUR:
+            return ts.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
+        if ts.hour >= SATURDAY_END_HOUR:
+            next_day = ts + pd.Timedelta(days=1)
+            return next_valid_workday_start(next_day)
+        return ts
+
+    # Lunes a viernes
+    if ts.hour < WORK_START_HOUR:
+        return ts.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
+
+    return ts
 st.set_page_config(page_title="Primera llamada por lead (Pipedrive)", layout="wide")
 
 st.title("📞 Tiempo hasta la primera llamada saliente por lead")
