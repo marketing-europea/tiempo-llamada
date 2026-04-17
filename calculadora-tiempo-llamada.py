@@ -1,6 +1,7 @@
 import io
 import pandas as pd
 import streamlit as st
+from datetime import datetime, time, timedelta
 
 st.set_page_config(page_title="Primera llamada por lead (Pipedrive)", layout="wide")
 
@@ -20,16 +21,14 @@ COL_DUE_DATE = "Actividad - Fecha de vencimiento"
 COL_SUBJECT = "Actividad - Asunto"
 COL_OWNER = "Negocio - Propietario"
 
-WORK_START_HOUR = 9
+# Horario call center
+WORK_START = time(9, 0, 0)
+WORK_END_WEEKDAY = time(23, 59, 59)   # lunes a viernes, cambia esto si quieres otra hora
+WORK_END_SATURDAY = time(18, 0, 0)    # sábado hasta las 18:00
 
-
-def adjust_creation_time(ts: pd.Timestamp) -> pd.Timestamp:
-    """Si el lead se crea antes de WORK_START_HOUR, ajusta a esa hora."""
-    if pd.isna(ts):
-        return ts
-    if ts.hour < WORK_START_HOUR:
-        return ts.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
-    return ts
+# Filtro de outliers
+MAX_HOURS = 24
+APPLY_MAX_FILTER = True
 
 
 def format_duration_exact(seconds: float) -> str:
@@ -48,6 +47,91 @@ def format_duration_exact(seconds: float) -> str:
     return f"{sign}{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+def is_working_day(dt: datetime) -> bool:
+    # lunes=0 ... sábado=5, domingo=6
+    return dt.weekday() <= 5
+
+
+def get_day_bounds(dt: datetime):
+    """Devuelve inicio y fin de jornada para el día de dt."""
+    start_dt = datetime.combine(dt.date(), WORK_START)
+
+    if dt.weekday() == 5:  # sábado
+        end_dt = datetime.combine(dt.date(), WORK_END_SATURDAY)
+    elif dt.weekday() <= 4:  # lunes-viernes
+        end_dt = datetime.combine(dt.date(), WORK_END_WEEKDAY)
+    else:
+        return None, None
+
+    return start_dt, end_dt
+
+
+def next_work_start(dt: datetime) -> datetime:
+    """Mueve un datetime al siguiente momento hábil."""
+    cur = dt
+
+    while True:
+        if not is_working_day(cur):
+            cur = datetime.combine(cur.date() + timedelta(days=1), WORK_START)
+            continue
+
+        day_start, day_end = get_day_bounds(cur)
+
+        if cur < day_start:
+            return day_start
+
+        if cur > day_end:
+            cur = datetime.combine(cur.date() + timedelta(days=1), WORK_START)
+            continue
+
+        return cur
+
+
+def business_seconds_between(start: datetime, end: datetime) -> float:
+    """
+    Calcula segundos hábiles entre start y end.
+    Horario:
+      - lunes a viernes: desde WORK_START hasta WORK_END_WEEKDAY
+      - sábado: desde WORK_START hasta 18:00
+      - domingo: no cuenta
+    """
+    if pd.isna(start) or pd.isna(end):
+        return float("nan")
+
+    if end < start:
+        return float("nan")
+
+    current = next_work_start(start)
+    end = end.to_pydatetime() if isinstance(end, pd.Timestamp) else end
+    current = current.to_pydatetime() if isinstance(current, pd.Timestamp) else current
+
+    total_seconds = 0.0
+
+    while current < end:
+        if not is_working_day(current):
+            current = next_work_start(current)
+            continue
+
+        day_start, day_end = get_day_bounds(current)
+        if day_start is None:
+            current = next_work_start(current + timedelta(days=1))
+            continue
+
+        window_start = max(current, day_start)
+        window_end = min(end, day_end)
+
+        if window_end > window_start:
+            total_seconds += (window_end - window_start).total_seconds()
+
+        if end <= day_end:
+            break
+
+        current = datetime.combine(current.date() + timedelta(days=1), WORK_START)
+        current = next_work_start(current)
+
+    return total_seconds
+
+
 def compute_first_outbound_call(df: pd.DataFrame):
     df = df.copy()
 
@@ -60,37 +144,47 @@ def compute_first_outbound_call(df: pd.DataFrame):
     # Filas válidas
     df = df.dropna(subset=[COL_DEAL_ID, COL_CREATED, COL_DUE_DATE, COL_SUBJECT]).copy()
 
-    # Solo actividades cuyo asunto contenga "Llamada saliente"
+    # Solo llamadas salientes
     df = df[df[COL_SUBJECT].str.contains("llamada saliente", case=False, na=False)].copy()
 
-    # Ajuste horario de creación
-    df["created_adjusted"] = df[COL_CREATED].apply(adjust_creation_time)
+    # Solo posteriores o iguales a creación
+    df = df[df[COL_DUE_DATE] >= df[COL_CREATED]].copy()
 
-    # Tiempo entre creación y actividad
-    df["delta_sec"] = (df[COL_DUE_DATE] - df["created_adjusted"]).dt.total_seconds()
+    # Delta real en segundos naturales
+    df["delta_sec_natural"] = (df[COL_DUE_DATE] - df[COL_CREATED]).dt.total_seconds()
 
-    # Solo actividades posteriores o iguales a la creación ajustada
-    df = df[df["delta_sec"] >= 0].copy()
+    # Delta en segundos hábiles
+    df["delta_sec"] = df.apply(
+        lambda row: business_seconds_between(row[COL_CREATED], row[COL_DUE_DATE]),
+        axis=1
+    )
+
+    # Filtrar nulos
+    df = df.dropna(subset=["delta_sec"]).copy()
+
+    # Filtro opcional: descartar > 1 día hábil
+    if APPLY_MAX_FILTER:
+        max_seconds = MAX_HOURS * 3600
+        df = df[df["delta_sec"] <= max_seconds].copy()
 
     # Orden cronológico por lead
     df = df.sort_values([COL_DEAL_ID, COL_DUE_DATE, COL_SUBJECT]).copy()
 
-    # Primera actividad por lead único
+    # Primera llamada por lead único
     first_calls = df.drop_duplicates(subset=[COL_DEAL_ID], keep="first").copy()
 
-    # Renombrar para claridad
+    # Renombrar
     first_calls = first_calls.rename(columns={
         COL_DUE_DATE: "first_call_time",
         COL_SUBJECT: "first_call_subject"
     })
 
-    # Seleccionar columnas finales
     keep_cols = [
         COL_DEAL_ID,
         COL_CREATED,
-        "created_adjusted",
         "first_call_time",
         "first_call_subject",
+        "delta_sec_natural",
         "delta_sec"
     ]
 
@@ -99,6 +193,7 @@ def compute_first_outbound_call(df: pd.DataFrame):
 
     res = first_calls[keep_cols].copy()
     res["tiempo_hasta_primera_llamada"] = res["delta_sec"].apply(format_duration_exact)
+    res["tiempo_natural"] = res["delta_sec_natural"].apply(format_duration_exact)
     res = res.sort_values(COL_CREATED).reset_index(drop=True)
 
     # Resumen por agente sobre leads únicos
@@ -142,7 +237,6 @@ if uploaded:
         st.error(f"No he podido leer el Excel: {e}")
         st.stop()
 
-    # Validación
     required_cols = [COL_DEAL_ID, COL_CREATED, COL_DUE_DATE, COL_SUBJECT]
     missing = [c for c in required_cols if c not in df.columns]
 
@@ -153,10 +247,11 @@ if uploaded:
 
     res, agent_stats, media_total, mediana_total, debug_calls = compute_first_outbound_call(df)
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Leads únicos con 1ª llamada", f"{len(res):,}".replace(",", "."))
     col2.metric("Media total", media_total)
     col3.metric("Mediana total", mediana_total)
+    col4.metric("Filtro máximo", f"{MAX_HOURS} h" if APPLY_MAX_FILTER else "Sin filtro")
 
     st.subheader("✅ Primera llamada saliente por lead único")
     st.dataframe(res, use_container_width=True)
@@ -169,7 +264,14 @@ if uploaded:
         )
 
     with st.expander("🔎 Debug: llamadas salientes filtradas y ordenadas"):
-        debug_cols = [COL_DEAL_ID, COL_CREATED, "created_adjusted", COL_DUE_DATE, COL_SUBJECT, "delta_sec"]
+        debug_cols = [
+            COL_DEAL_ID,
+            COL_CREATED,
+            COL_DUE_DATE,
+            COL_SUBJECT,
+            "delta_sec_natural",
+            "delta_sec"
+        ]
         if COL_OWNER in debug_calls.columns:
             debug_cols.append(COL_OWNER)
         st.dataframe(debug_calls[debug_cols], use_container_width=True)
