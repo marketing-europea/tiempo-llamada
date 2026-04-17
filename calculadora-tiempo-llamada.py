@@ -13,6 +13,7 @@ st.write(
 )
 
 uploaded = st.file_uploader("Sube tu Excel (.xlsx)", type=["xlsx"])
+apply_filter = st.checkbox("Aplicar filtro: excluir llamadas > 1 día", value=False)
 
 COL_DEAL_ID = "Negocio - ID"
 COL_CREATED = "Negocio - Negocio creado el"
@@ -21,6 +22,7 @@ COL_SUBJECT = "Actividad - Asunto"
 COL_OWNER = "Negocio - Propietario"
 
 WORK_START_HOUR = 9
+MAX_SECONDS = 86400  # 1 día
 
 
 def adjust_creation_time(ts: pd.Timestamp) -> pd.Timestamp:
@@ -48,7 +50,7 @@ def format_duration_exact(seconds: float) -> str:
     return f"{sign}{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def compute_first_outbound_call(df: pd.DataFrame):
+def compute_first_outbound_call(df: pd.DataFrame, apply_filter: bool):
     df = df.copy()
 
     # Normalizar tipos
@@ -72,7 +74,9 @@ def compute_first_outbound_call(df: pd.DataFrame):
     # Solo actividades posteriores o iguales a la creación ajustada
     df = df[df["delta_sec"] >= 0].copy()
 
-    df = df[df["delta_sec"] <= 86400].copy()
+    # Filtro opcional: excluir llamadas > 1 día
+    if apply_filter:
+        df = df[df["delta_sec"] <= MAX_SECONDS].copy()
 
     # Orden cronológico por lead
     df = df.sort_values([COL_DEAL_ID, COL_DUE_DATE, COL_SUBJECT]).copy()
@@ -153,7 +157,7 @@ if uploaded:
         st.write("Columnas detectadas:", list(df.columns))
         st.stop()
 
-    res, agent_stats, media_total, mediana_total, debug_calls = compute_first_outbound_call(df)
+    res, agent_stats, media_total, mediana_total, debug_calls = compute_first_outbound_call(df, apply_filter)
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Leads únicos con 1ª llamada", f"{len(res):,}".replace(",", "."))
