@@ -74,12 +74,12 @@ def compute_first_outbound_call(df: pd.DataFrame, apply_filter: bool):
     # Solo actividades posteriores o iguales a la creación ajustada
     df = df[df["delta_sec"] >= 0].copy()
 
-    # Filtro opcional: excluir llamadas > 1 día
+    # Filtro opcional: excluir llamadas de más de 1 día
     if apply_filter:
         df = df[df["delta_sec"] <= MAX_SECONDS].copy()
 
-    # Orden cronológico por lead
-    df = df.sort_values([COL_DEAL_ID, COL_DUE_DATE, COL_SUBJECT]).copy()
+    # Orden cronológico por lead: así la primera fila será la primera llamada
+    df = df.sort_values([COL_DEAL_ID, COL_DUE_DATE, COL_SUBJECT], ascending=[True, True, True]).copy()
 
     # Primera actividad por lead único
     first_calls = df.drop_duplicates(subset=[COL_DEAL_ID], keep="first").copy()
@@ -175,7 +175,14 @@ if uploaded:
         )
 
     with st.expander("🔎 Debug: llamadas salientes filtradas y ordenadas"):
-        debug_cols = [COL_DEAL_ID, COL_CREATED, "created_adjusted", COL_DUE_DATE, COL_SUBJECT, "delta_sec"]
+        debug_cols = [
+            COL_DEAL_ID,
+            COL_CREATED,
+            "created_adjusted",
+            COL_DUE_DATE,
+            COL_SUBJECT,
+            "delta_sec"
+        ]
         if COL_OWNER in debug_calls.columns:
             debug_cols.append(COL_OWNER)
         st.dataframe(debug_calls[debug_cols], use_container_width=True)
