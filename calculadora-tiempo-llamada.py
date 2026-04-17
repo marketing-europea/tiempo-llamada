@@ -1,22 +1,48 @@
 import io
+import time
+import requests
 import pandas as pd
 import streamlit as st
 
-import pandas as pd
+st.set_page_config(page_title="Primera llamada por lead (Pipedrive)", layout="wide")
+
+st.title("📞 Tiempo hasta la primera llamada saliente por lead")
+st.write(
+    "Sube un Excel exportado de Pipedrive (Actividades). "
+    "La app calcula, para cada negocio, la PRIMERA actividad cuyo asunto contiene "
+    "'Llamada saliente', y mide el tiempo desde la creación del negocio hasta esa primera llamada. "
+    "Si el tiempo supera 30 minutos, consulta el historial del deal para detectar un cambio de propietario "
+    "y recalcular desde la reasignación al agente que hizo la llamada."
+)
+
+uploaded = st.file_uploader("Sube tu Excel (.xlsx)", type=["xlsx"])
+apply_filter_1day = st.checkbox("Excluir primeras llamadas con 1 día o más de diferencia", value=False)
+
+st.subheader("🔐 Configuración API Pipedrive")
+api_token = st.text_input("API token", type="password")
+company_domain = st.text_input("Subdominio de Pipedrive", placeholder="tuempresa")
+
+COL_DEAL_ID = "Negocio - ID"
+COL_CREATED = "Negocio - Negocio creado el"
+COL_DUE_DATE = "Actividad - Fecha de vencimiento"
+COL_SUBJECT = "Actividad - Asunto"
+COL_OWNER = "Negocio - Propietario"
 
 WORK_START_HOUR = 9
 SATURDAY_END_HOUR = 18
+ONE_DAY_SECONDS = 86400
+FLOW_THRESHOLD_SECONDS = 30 * 60  # 30 minutos
 
 HOLIDAYS_2026 = {
-    pd.Timestamp("2026-01-01").date(),  # Año Nuevo
-    pd.Timestamp("2026-01-06").date(),  # Epifanía del Señor
-    pd.Timestamp("2026-04-03").date(),  # Viernes Santo
-    pd.Timestamp("2026-05-01").date(),  # Fiesta del Trabajo
-    pd.Timestamp("2026-08-15").date(),  # Asunción de la Virgen
-    pd.Timestamp("2026-10-12").date(),  # Fiesta Nacional de España
-    pd.Timestamp("2026-11-01").date(),  # Todos los Santos
-    pd.Timestamp("2026-12-08").date(),  # Inmaculada Concepción
-    pd.Timestamp("2026-12-25").date(),  # Navidad
+    pd.Timestamp("2026-01-01").date(),
+    pd.Timestamp("2026-01-06").date(),
+    pd.Timestamp("2026-04-03").date(),
+    pd.Timestamp("2026-05-01").date(),
+    pd.Timestamp("2026-08-15").date(),
+    pd.Timestamp("2026-10-12").date(),
+    pd.Timestamp("2026-11-01").date(),
+    pd.Timestamp("2026-12-08").date(),
+    pd.Timestamp("2026-12-25").date(),
 }
 
 
@@ -25,15 +51,10 @@ def is_holiday(ts: pd.Timestamp) -> bool:
 
 
 def is_non_working_day(ts: pd.Timestamp) -> bool:
-    # domingo o festivo
     return ts.weekday() == 6 or is_holiday(ts)
 
 
 def next_valid_workday_start(ts: pd.Timestamp) -> pd.Timestamp:
-    """
-    Mueve la fecha al siguiente día laborable a las 09:00.
-    Considera domingos y festivos.
-    """
     ts = ts.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
 
     while ts.weekday() == 6 or is_holiday(ts):
@@ -61,7 +82,6 @@ def adjust_creation_time(ts: pd.Timestamp) -> pd.Timestamp:
 
     # Sábado
     if ts.weekday() == 5:
-        # Si además fuese festivo, ya habría entrado arriba
         if ts.hour < WORK_START_HOUR:
             return ts.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
         if ts.hour >= SATURDAY_END_HOUR:
@@ -74,63 +94,9 @@ def adjust_creation_time(ts: pd.Timestamp) -> pd.Timestamp:
         return ts.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
 
     return ts
-st.set_page_config(page_title="Primera llamada por lead (Pipedrive)", layout="wide")
-
-st.title("📞 Tiempo hasta la primera llamada saliente por lead")
-st.write(
-    "Sube un Excel exportado de Pipedrive (Actividades). "
-    "La app calcula, para cada negocio, la PRIMERA actividad cuyo asunto contiene "
-    "'Llamada saliente', y mide el tiempo desde la creación del negocio hasta esa primera llamada. "
-    "La media y la mediana se calculan sobre leads únicos."
-)
-
-uploaded = st.file_uploader("Sube tu Excel (.xlsx)", type=["xlsx"])
-apply_filter_1day = st.checkbox("Excluir primeras llamadas con 1 día o más de diferencia", value=False)
-
-COL_DEAL_ID = "Negocio - ID"
-COL_CREATED = "Negocio - Negocio creado el"
-COL_DUE_DATE = "Actividad - Fecha de vencimiento"
-COL_SUBJECT = "Actividad - Asunto"
-COL_OWNER = "Negocio - Propietario"
-
-WORK_START_HOUR = 9
-ONE_DAY_SECONDS = 86400
-
-
-def adjust_creation_time(ts: pd.Timestamp) -> pd.Timestamp:
-    """Ajusta la fecha de creación al horario operativo:
-    - lunes a viernes: desde las 09:00
-    - sábado: desde las 09:00 hasta las 18:00
-    - domingo: pasa al lunes a las 09:00
-    """
-    if pd.isna(ts):
-        return ts
-
-    # Domingo -> lunes 09:00
-    if ts.weekday() == 6:
-        next_monday = ts + pd.Timedelta(days=1)
-        return next_monday.replace(hour=9, minute=0, second=0, microsecond=0)
-
-    # Sábado
-    if ts.weekday() == 5:
-        # Antes de las 09:00 -> sábado 09:00
-        if ts.hour < 9:
-            return ts.replace(hour=9, minute=0, second=0, microsecond=0)
-        # A partir de las 18:00 -> lunes 09:00
-        if ts.hour >= 18:
-            next_monday = ts + pd.Timedelta(days=2)
-            return next_monday.replace(hour=9, minute=0, second=0, microsecond=0)
-        return ts
-
-    # Lunes a viernes
-    if ts.hour < 9:
-        return ts.replace(hour=9, minute=0, second=0, microsecond=0)
-
-    return ts
 
 
 def format_duration_exact(seconds: float) -> str:
-    """Formatea segundos como HH:MM:SS o Xd HH:MM:SS."""
     if pd.isna(seconds):
         return ""
     sign = "-" if seconds < 0 else ""
@@ -145,7 +111,48 @@ def format_duration_exact(seconds: float) -> str:
     return f"{sign}{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def compute_first_outbound_call(df: pd.DataFrame, apply_filter_1day: bool):
+def normalize_name(value) -> str:
+    if pd.isna(value) or value is None:
+        return ""
+    return " ".join(str(value).strip().lower().split())
+
+
+@st.cache_data(show_spinner=False)
+def fetch_deal_flow(_api_token: str, _company_domain: str, deal_id: int) -> dict:
+    url = f"https://{_company_domain}.pipedrive.com/api/v1/deals/{deal_id}/flow?api_token={_api_token}"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_last_assignment_time_for_owner(flow_json: dict, call_owner: str, call_time: pd.Timestamp):
+    """
+    Busca en el flow la última asignación al agente que hace la llamada,
+    anterior o igual a la fecha de la llamada.
+    """
+    target_owner = normalize_name(call_owner)
+    best_time = pd.NaT
+
+    for item in flow_json.get("data", []) or []:
+        if item.get("object") != "dealChange":
+            continue
+
+        data = item.get("data", {}) or {}
+        if data.get("field_key") != "user_id":
+            continue
+
+        additional = data.get("additional_data", {}) or {}
+        new_owner = normalize_name(additional.get("new_value_formatted"))
+        log_time = pd.to_datetime(data.get("log_time"), errors="coerce")
+
+        if new_owner == target_owner and pd.notna(log_time) and log_time <= call_time:
+            if pd.isna(best_time) or log_time > best_time:
+                best_time = log_time
+
+    return best_time
+
+
+def compute_first_outbound_call(df: pd.DataFrame):
     df = df.copy()
 
     # Normalizar tipos
@@ -157,55 +164,114 @@ def compute_first_outbound_call(df: pd.DataFrame, apply_filter_1day: bool):
     # Filas válidas
     df = df.dropna(subset=[COL_DEAL_ID, COL_CREATED, COL_DUE_DATE, COL_SUBJECT]).copy()
 
-    # Solo actividades cuyo asunto contenga "Llamada saliente"
+    # Solo llamadas salientes
     df = df[df[COL_SUBJECT].str.contains("llamada saliente", case=False, na=False)].copy()
 
     # Ajuste horario de creación
     df["created_adjusted"] = df[COL_CREATED].apply(adjust_creation_time)
 
-    # Tiempo entre creación y actividad
-    df["delta_sec"] = (df[COL_DUE_DATE] - df["created_adjusted"]).dt.total_seconds()
+    # Tiempo base
+    df["delta_sec_base"] = (df[COL_DUE_DATE] - df["created_adjusted"]).dt.total_seconds()
 
-    # Solo actividades posteriores o iguales a la creación ajustada
-    df = df[df["delta_sec"] >= 0].copy()
+    # Solo posteriores
+    df = df[df["delta_sec_base"] >= 0].copy()
 
-    # Filtro opcional: excluir >= 1 día
+    # Filtro opcional >= 1 día en el tiempo base
     if apply_filter_1day:
-        df = df[df["delta_sec"] < ONE_DAY_SECONDS].copy()
+        df = df[df["delta_sec_base"] < ONE_DAY_SECONDS].copy()
 
     # Orden cronológico por lead
     df = df.sort_values([COL_DEAL_ID, COL_DUE_DATE, COL_SUBJECT]).copy()
 
-    # Primera actividad por lead único
+    # Primera llamada por lead único
     first_calls = df.drop_duplicates(subset=[COL_DEAL_ID], keep="first").copy()
 
-    # Renombrar para claridad
+    # Renombrar
     first_calls = first_calls.rename(columns={
         COL_DUE_DATE: "first_call_time",
-        COL_SUBJECT: "first_call_subject"
+        COL_SUBJECT: "first_call_subject",
+        COL_OWNER: "call_owner"
     })
 
-    # Seleccionar columnas finales
+    # Resolver start_time real
+    real_start_times = []
+    start_sources = []
+    reassignment_times = []
+    flow_checked = []
+
+    progress = st.progress(0)
+    total_rows = len(first_calls)
+
+    for i, (_, row) in enumerate(first_calls.iterrows(), start=1):
+        created_adjusted = row["created_adjusted"]
+        first_call_time = row["first_call_time"]
+        delta_sec_base = row["delta_sec_base"]
+        deal_id = int(row[COL_DEAL_ID])
+        call_owner = row["call_owner"] if "call_owner" in row else None
+
+        start_time_real = created_adjusted
+        start_source = "created_adjusted"
+        reassignment_time = pd.NaT
+        checked_flow = False
+
+        if pd.notna(delta_sec_base) and delta_sec_base > FLOW_THRESHOLD_SECONDS and api_token and company_domain:
+            checked_flow = True
+            try:
+                flow_json = fetch_deal_flow(api_token, company_domain, deal_id)
+                reassignment_time = get_last_assignment_time_for_owner(flow_json, call_owner, first_call_time)
+
+                if pd.notna(reassignment_time):
+                    start_time_real = reassignment_time
+                    start_source = "owner_reassignment"
+            except Exception:
+                pass
+
+        real_start_times.append(start_time_real)
+        start_sources.append(start_source)
+        reassignment_times.append(reassignment_time)
+        flow_checked.append(checked_flow)
+
+        progress.progress(i / total_rows if total_rows else 1)
+
+    first_calls["reassignment_time"] = reassignment_times
+    first_calls["start_time_real"] = real_start_times
+    first_calls["start_source"] = start_sources
+    first_calls["flow_checked"] = flow_checked
+
+    # SLA real final
+    first_calls["delta_sec"] = (first_calls["first_call_time"] - first_calls["start_time_real"]).dt.total_seconds()
+    first_calls = first_calls[first_calls["delta_sec"] >= 0].copy()
+
+    # Filtro opcional >= 1 día sobre tiempo final
+    if apply_filter_1day:
+        first_calls = first_calls[first_calls["delta_sec"] < ONE_DAY_SECONDS].copy()
+
     keep_cols = [
         COL_DEAL_ID,
         COL_CREATED,
         "created_adjusted",
+        "reassignment_time",
+        "start_time_real",
+        "start_source",
         "first_call_time",
         "first_call_subject",
-        "delta_sec"
+        "delta_sec_base",
+        "delta_sec",
+        "flow_checked",
     ]
 
-    if COL_OWNER in first_calls.columns:
-        keep_cols.append(COL_OWNER)
+    if "call_owner" in first_calls.columns:
+        keep_cols.append("call_owner")
 
     res = first_calls[keep_cols].copy()
+    res["tiempo_base_desde_creacion"] = res["delta_sec_base"].apply(format_duration_exact)
     res["tiempo_hasta_primera_llamada"] = res["delta_sec"].apply(format_duration_exact)
     res = res.sort_values(COL_CREATED).reset_index(drop=True)
 
-    # Resumen por agente sobre leads únicos
-    if COL_OWNER in res.columns:
+    # Resumen por agente
+    if "call_owner" in res.columns:
         agent_stats = (
-            res.groupby(COL_OWNER, dropna=False)
+            res.groupby("call_owner", dropna=False)
             .agg(
                 leads_unicos=(COL_DEAL_ID, "count"),
                 media_seg=("delta_sec", "mean"),
@@ -219,7 +285,6 @@ def compute_first_outbound_call(df: pd.DataFrame, apply_filter_1day: bool):
     else:
         agent_stats = pd.DataFrame()
 
-    # Media y mediana total sobre leads únicos
     media_total = format_duration_exact(res["delta_sec"].mean()) if len(res) > 0 else ""
     mediana_total = format_duration_exact(res["delta_sec"].median()) if len(res) > 0 else ""
 
@@ -243,7 +308,6 @@ if uploaded:
         st.error(f"No he podido leer el Excel: {e}")
         st.stop()
 
-    # Validación
     required_cols = [COL_DEAL_ID, COL_CREATED, COL_DUE_DATE, COL_SUBJECT]
     missing = [c for c in required_cols if c not in df.columns]
 
@@ -252,7 +316,7 @@ if uploaded:
         st.write("Columnas detectadas:", list(df.columns))
         st.stop()
 
-    res, agent_stats, media_total, mediana_total, debug_calls = compute_first_outbound_call(df, apply_filter_1day)
+    res, agent_stats, media_total, mediana_total, debug_calls = compute_first_outbound_call(df)
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Leads únicos con 1ª llamada", f"{len(res):,}".replace(",", "."))
@@ -265,12 +329,12 @@ if uploaded:
     if len(agent_stats) > 0:
         st.subheader("👤 Resumen por agente (sobre leads únicos)")
         st.dataframe(
-            agent_stats[[COL_OWNER, "leads_unicos", "media", "mediana"]],
+            agent_stats[["call_owner", "leads_unicos", "media", "mediana"]],
             use_container_width=True
         )
 
     with st.expander("🔎 Debug: llamadas salientes filtradas y ordenadas"):
-        debug_cols = [COL_DEAL_ID, COL_CREATED, "created_adjusted", COL_DUE_DATE, COL_SUBJECT, "delta_sec"]
+        debug_cols = [COL_DEAL_ID, COL_CREATED, "created_adjusted", COL_DUE_DATE, COL_SUBJECT, "delta_sec_base"]
         if COL_OWNER in debug_calls.columns:
             debug_cols.append(COL_OWNER)
         st.dataframe(debug_calls[debug_cols], use_container_width=True)
