@@ -11,6 +11,7 @@ st.write(
     "Sube un Excel exportado de Pipedrive (Actividades). "
     "La app calcula, para cada negocio, la PRIMERA actividad de contacto y mide el tiempo hasta ese primer contacto. "
     "Puedes elegir entre medir solo la primera llamada saliente o el primer contacto (llamada + WhatsApp). "
+    "Solo se incluyen leads que tengan al menos un registro de llamada. "
     "Si el tiempo base supera 30 minutos, consulta el flow del deal y solo usa la reasignación "
     "si el primer evento relevante tras la creación es un cambio de propietario al agente que hace ese primer contacto."
 )
@@ -33,6 +34,7 @@ COL_CREATED = "Negocio - Negocio creado el"
 COL_DUE_DATE = "Actividad - Fecha de vencimiento"
 COL_SUBJECT = "Actividad - Asunto"
 COL_OWNER = "Negocio - Propietario"
+COL_ACTIVITY_OWNER = "Actividad - Asignada al usuario"
 
 ONE_DAY_SECONDS = 86400
 FLOW_THRESHOLD_SECONDS = 30 * 60  # 30 minutos
@@ -56,7 +58,7 @@ def normalize_name(value) -> str:
     return " ".join(str(value).strip().lower().split())
 
 
-# Horario general de disponibilidad del equipo
+# Horario general del equipo
 # Lunes a viernes: 09:00 - 20:00
 # Sábados: 12:30 - 20:00
 # Domingos: sin servicio
@@ -68,6 +70,12 @@ TEAM_SCHEDULE = {
     4: [(time(9, 0), time(20, 0))],    # viernes
     5: [(time(12, 30), time(20, 0))],  # sábado
 }
+
+
+def clean_text(value) -> str:
+    if pd.isna(value) or value is None:
+        return ""
+    return str(value).strip()
 
 
 def is_holiday(ts: pd.Timestamp) -> bool:
@@ -224,7 +232,12 @@ def extract_relevant_flow_events(flow_json: dict, contact_time: pd.Timestamp) ->
     return events
 
 
-def get_start_time_real_from_flow(flow_json: dict, created_adjusted: pd.Timestamp, contact_owner: str, contact_time: pd.Timestamp):
+def get_start_time_real_from_flow(
+    flow_json: dict,
+    created_adjusted: pd.Timestamp,
+    contact_owner: str,
+    contact_time: pd.Timestamp
+):
     """
     Solo reasigna si el primer evento relevante tras la creación ajustada
     es un cambio de propietario al agente que hace el primer contacto.
@@ -285,26 +298,30 @@ def compute_first_contact(df: pd.DataFrame, apply_filter_1day: bool, selected_mo
     df[COL_CREATED] = pd.to_datetime(df[COL_CREATED], errors="coerce")
     df[COL_DUE_DATE] = pd.to_datetime(df[COL_DUE_DATE], errors="coerce")
     df[COL_SUBJECT] = df[COL_SUBJECT].astype(str).str.strip()
+    df[COL_OWNER] = df[COL_OWNER].apply(clean_text)
+    df[COL_ACTIVITY_OWNER] = df[COL_ACTIVITY_OWNER].apply(clean_text)
 
     df = df.dropna(subset=[COL_DEAL_ID, COL_CREATED, COL_DUE_DATE, COL_SUBJECT]).copy()
 
-    # Excluir leads sin ningún registro de llamada
+    # Excluir leads que no tengan ninguna llamada en absoluto
     df["has_any_call"] = df[COL_SUBJECT].str.contains(
         r"llamada saliente|llamada entrante",
         case=False,
         na=False
     )
-
     deals_with_call = df.loc[df["has_any_call"], COL_DEAL_ID].dropna().unique()
     df = df[df[COL_DEAL_ID].isin(deals_with_call)].copy()
 
-    # Filtrar según el modo elegido
+    # Filtrar solo las actividades válidas para el modo elegido
     pattern = get_activity_filter_pattern(selected_mode)
     df = df[df[COL_SUBJECT].str.contains(pattern, case=False, na=False)].copy()
 
-    # Separar owner del deal y owner real de la actividad
-    df["deal_owner"] = df[COL_OWNER].astype(str).str.strip()
-    df["contact_owner"] = df[COL_ACTIVITY_OWNER].astype(str).str.strip()
+    # Owner del deal vs owner real de la actividad
+    df["deal_owner"] = df[COL_OWNER]
+    df["contact_owner"] = df[COL_ACTIVITY_OWNER]
+
+    # Si alguna actividad viniera sin usuario asignado, evitamos vacíos visibles
+    df["contact_owner"] = df["contact_owner"].replace("", "Sin asignar")
 
     df["created_adjusted"] = df.apply(
         lambda row: adjust_creation_time_for_agent(row[COL_CREATED], row["contact_owner"]),
@@ -323,13 +340,14 @@ def compute_first_contact(df: pd.DataFrame, apply_filter_1day: bool, selected_mo
     df = df[df["delta_sec_base"] >= 0].copy()
     df = df.sort_values([COL_DEAL_ID, COL_DUE_DATE, COL_SUBJECT]).copy()
 
+    # Primera actividad de contacto por lead
     first_contacts = df.drop_duplicates(subset=[COL_DEAL_ID], keep="first").copy()
 
     first_contacts = first_contacts.rename(columns={
         COL_DUE_DATE: "first_contact_time",
         COL_SUBJECT: "first_contact_subject",
     })
-    
+
     real_start_times = []
     start_sources = []
     reassignment_times = []
@@ -350,7 +368,12 @@ def compute_first_contact(df: pd.DataFrame, apply_filter_1day: bool, selected_mo
         reassignment_time = pd.NaT
         checked_flow = False
 
-        if pd.notna(delta_sec_base) and delta_sec_base > FLOW_THRESHOLD_SECONDS and api_token and company_domain:
+        if (
+            pd.notna(delta_sec_base)
+            and delta_sec_base > FLOW_THRESHOLD_SECONDS
+            and api_token
+            and company_domain
+        ):
             checked_flow = True
             try:
                 flow_json = fetch_deal_flow(api_token, company_domain, deal_id)
@@ -392,8 +415,9 @@ def compute_first_contact(df: pd.DataFrame, apply_filter_1day: bool, selected_mo
     keep_cols = [
         COL_DEAL_ID,
         COL_CREATED,
-        "created_adjusted",
         "deal_owner",
+        "contact_owner",
+        "created_adjusted",
         "reassignment_time",
         "start_time_real",
         "start_source",
@@ -402,8 +426,6 @@ def compute_first_contact(df: pd.DataFrame, apply_filter_1day: bool, selected_mo
         "delta_sec_base",
         "delta_sec",
         "flow_checked",
-        "contact_owner",
-        
     ]
 
     res = first_contacts[keep_cols].copy()
@@ -455,7 +477,14 @@ if uploaded:
         st.error(f"No he podido leer el Excel: {e}")
         st.stop()
 
-    required_cols = [COL_DEAL_ID, COL_CREATED, COL_DUE_DATE, COL_SUBJECT, COL_OWNER]
+    required_cols = [
+        COL_DEAL_ID,
+        COL_CREATED,
+        COL_DUE_DATE,
+        COL_SUBJECT,
+        COL_OWNER,
+        COL_ACTIVITY_OWNER,
+    ]
     missing = [c for c in required_cols if c not in df.columns]
 
     if missing:
@@ -496,7 +525,8 @@ if uploaded:
             COL_SUBJECT,
             "delta_sec_base",
         ]
-        st.dataframe(debug_calls[debug_cols], use_container_width=True)
+        debug_view = debug_calls[debug_cols].sort_values([COL_DEAL_ID, COL_DUE_DATE, COL_SUBJECT])
+        st.dataframe(debug_view, use_container_width=True)
 
     xlsx_bytes = to_excel_bytes(res, agent_stats, debug_calls)
     st.download_button(
