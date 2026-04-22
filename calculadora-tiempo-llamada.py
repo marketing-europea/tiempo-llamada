@@ -13,7 +13,7 @@ st.write(
     "Sube un Excel para obtener los negocios a analizar. "
     "La app usa el flow API de Pipedrive como fuente de verdad para reconstruir "
     "reasignaciones, estados, etapas y actividades, "
-    "y calcula la primera llamada/contacto tras cada asignación real."
+    "y calcula tanto la primera gestión como la primera llamada/contacto tras cada asignación real."
 )
 
 uploaded = st.file_uploader("Sube tu Excel (.xlsx)", type=["xlsx"])
@@ -117,6 +117,10 @@ def get_contact_pattern(selected_mode: str) -> str:
     if selected_mode == "Primera llamada saliente":
         return r"llamada saliente"
     return r"llamada saliente|whatsapp chat"
+
+
+def get_management_pattern() -> str:
+    return r"recordatorio agente|lead pendiente de llamar|llamada de seguimiento|recordatorio|pendiente de llamar"
 
 
 def get_result_labels(selected_mode: str):
@@ -271,6 +275,7 @@ def extract_flow_activities(flow_json: dict, selected_mode: str) -> pd.DataFrame
             "activity_subject": subject,
             "activity_id": data.get("id"),
             "activity_type": clean_text(data.get("type")),
+            "type_name": clean_text(data.get("type_name")),
             "activity_done": data.get("done"),
             "owner_name": clean_text(data.get("owner_name")),
             "assigned_to_user_id": data.get("assigned_to_user_id"),
@@ -284,8 +289,54 @@ def extract_flow_activities(flow_json: dict, selected_mode: str) -> pd.DataFrame
     if not rows:
         return pd.DataFrame(columns=[
             "activity_time", "activity_subject", "activity_id", "activity_type",
-            "activity_done", "owner_name", "assigned_to_user_id", "user_id",
+            "type_name", "activity_done", "owner_name", "assigned_to_user_id", "user_id",
             "due_date", "due_time", "add_time_raw", "marked_as_done_time_raw"
+        ])
+
+    return pd.DataFrame(rows).sort_values("activity_time").reset_index(drop=True)
+
+
+def extract_flow_management_activities(flow_json: dict) -> pd.DataFrame:
+    rows = []
+    pattern = get_management_pattern()
+
+    for item in flow_json.get("data", []) or []:
+        if item.get("object") != "activity":
+            continue
+
+        data = item.get("data", {}) or {}
+        subject = clean_text(data.get("subject"))
+        type_name = clean_text(data.get("type_name"))
+        activity_type = clean_text(data.get("type"))
+
+        text_to_check = f"{subject} {type_name} {activity_type}"
+
+        if not text_to_check:
+            continue
+
+        if not pd.Series([text_to_check]).str.contains(pattern, case=False, na=False).iloc[0]:
+            continue
+
+        activity_time = get_activity_datetime_local(data)
+        if pd.isna(activity_time):
+            continue
+
+        rows.append({
+            "activity_time": activity_time,
+            "activity_subject": subject,
+            "activity_id": data.get("id"),
+            "activity_type": activity_type,
+            "type_name": type_name,
+            "activity_done": data.get("done"),
+            "owner_name": clean_text(data.get("owner_name")),
+            "assigned_to_user_id": data.get("assigned_to_user_id"),
+            "user_id": data.get("user_id"),
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "activity_time", "activity_subject", "activity_id", "activity_type",
+            "type_name", "activity_done", "owner_name", "assigned_to_user_id", "user_id"
         ])
 
     return pd.DataFrame(rows).sort_values("activity_time").reset_index(drop=True)
@@ -415,12 +466,34 @@ def build_agent_summary(df: pd.DataFrame, count_col_name: str = "asignaciones_co
     return out
 
 
+def build_agent_summary_management(df: pd.DataFrame, count_col_name: str = "asignaciones_con_gestion") -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    out = (
+        df.groupby("agent_owner", dropna=False)
+        .agg(
+            **{
+                count_col_name: ("deal_id", "count"),
+                "media_seg_management": ("delta_sec_management", "mean"),
+                "mediana_seg_management": ("delta_sec_management", "median"),
+            }
+        )
+        .reset_index()
+    )
+    out["media"] = out["media_seg_management"].apply(format_duration_exact)
+    out["mediana"] = out["mediana_seg_management"].apply(format_duration_exact)
+    out = out.sort_values("media_seg_management", na_position="last")
+    return out
+
+
 def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_mode: str):
     labels = get_result_labels(selected_mode)
 
     rows = []
     debug_segments = []
     debug_activities = []
+    debug_management_activities = []
 
     deal_ids = (
         pd.to_numeric(deals_df[COL_DEAL_ID], errors="coerce")
@@ -459,9 +532,13 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                 "segment_start_adjusted": pd.NaT,
                 "segment_end": pd.NaT,
                 "effective_start": pd.NaT,
+                "first_management_time": pd.NaT,
+                "first_management_subject": "",
+                "delta_sec_management": float("nan"),
                 "first_contact_time": pd.NaT,
                 "first_contact_subject": "",
                 "delta_sec": float("nan"),
+                "has_management": False,
                 "has_contact": False,
                 "excluded_segment": False,
                 "exclusion_reason": "",
@@ -475,6 +552,7 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
         reopen_events = extract_reopen_events(flow_json)
         stage_changes_from_lead = extract_stage_changes_from_lead(flow_json)
         flow_activities = extract_flow_activities(flow_json, selected_mode)
+        flow_management_activities = extract_flow_management_activities(flow_json)
 
         segments = build_assignment_segments(
             deal_id=deal_id,
@@ -495,11 +573,19 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
             acts_dbg["deal_id"] = deal_id
             debug_activities.append(acts_dbg)
 
+        if not flow_management_activities.empty:
+            mgmt_dbg = flow_management_activities.copy()
+            if not segments.empty:
+                mgmt_dbg = assign_owner_to_flow_activities(mgmt_dbg, segments)
+            mgmt_dbg["deal_id"] = deal_id
+            debug_management_activities.append(mgmt_dbg)
+
         if segments.empty:
             progress.progress(i / total if total else 1)
             continue
 
         flow_activities = assign_owner_to_flow_activities(flow_activities, segments)
+        flow_management_activities = assign_owner_to_flow_activities(flow_management_activities, segments)
 
         for seg_idx, seg in segments.iterrows():
             segment_start = seg["segment_start"]
@@ -530,6 +616,34 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                 first_stage_old = first_stage_row["old_stage"]
                 first_stage_new = first_stage_row["new_stage"]
 
+            management_candidate = flow_management_activities[
+                (flow_management_activities["real_owner"] == agent_owner) &
+                (flow_management_activities["activity_time"] >= effective_start)
+            ].copy()
+
+            if pd.notna(segment_end):
+                management_candidate = management_candidate[
+                    management_candidate["activity_time"] < segment_end
+                ].copy()
+
+            management_candidate = management_candidate.sort_values(["activity_time", "activity_subject"])
+
+            first_management_time = pd.NaT
+            first_management_subject = ""
+            delta_sec_management = float("nan")
+            has_management = False
+
+            if not management_candidate.empty:
+                first_management = management_candidate.iloc[0]
+                first_management_time = first_management["activity_time"]
+                first_management_subject = first_management["activity_subject"]
+                has_management = True
+
+                if first_management_time < segment_start_adjusted:
+                    delta_sec_management = 0.0
+                else:
+                    delta_sec_management = seconds_between_exact(segment_start_adjusted, first_management_time)
+
             candidate = flow_activities[
                 (flow_activities["real_owner"] == agent_owner) &
                 (flow_activities["activity_time"] >= effective_start)
@@ -554,9 +668,13 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                         "segment_start_adjusted": segment_start_adjusted,
                         "segment_end": segment_end,
                         "effective_start": effective_start,
+                        "first_management_time": first_management_time,
+                        "first_management_subject": first_management_subject,
+                        "delta_sec_management": delta_sec_management,
                         "first_contact_time": pd.NaT,
                         "first_contact_subject": "",
                         "delta_sec": float("nan"),
+                        "has_management": has_management,
                         "has_contact": False,
                         "excluded_segment": True,
                         "exclusion_reason": f"Sale de {first_stage_old} a {first_stage_new} sin contacto tras la asignación",
@@ -576,9 +694,13 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                     "segment_start_adjusted": segment_start_adjusted,
                     "segment_end": segment_end,
                     "effective_start": effective_start,
+                    "first_management_time": first_management_time,
+                    "first_management_subject": first_management_subject,
+                    "delta_sec_management": delta_sec_management,
                     "first_contact_time": pd.NaT,
                     "first_contact_subject": "",
                     "delta_sec": float("nan"),
+                    "has_management": has_management,
                     "has_contact": False,
                     "excluded_segment": False,
                     "exclusion_reason": "",
@@ -603,9 +725,13 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                     "segment_start_adjusted": segment_start_adjusted,
                     "segment_end": segment_end,
                     "effective_start": effective_start,
+                    "first_management_time": first_management_time,
+                    "first_management_subject": first_management_subject,
+                    "delta_sec_management": delta_sec_management,
                     "first_contact_time": pd.NaT,
                     "first_contact_subject": "",
                     "delta_sec": float("nan"),
+                    "has_management": has_management,
                     "has_contact": False,
                     "excluded_segment": True,
                     "exclusion_reason": f"Sale de {first_stage_old} a {first_stage_new} antes del primer contacto del tramo",
@@ -630,9 +756,13 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                 "segment_start_adjusted": segment_start_adjusted,
                 "segment_end": segment_end,
                 "effective_start": effective_start,
+                "first_management_time": first_management_time,
+                "first_management_subject": first_management_subject,
+                "delta_sec_management": delta_sec_management,
                 "first_contact_time": first_contact_time,
                 "first_contact_subject": first_contact_subject,
                 "delta_sec": delta_sec,
+                "has_management": has_management,
                 "has_contact": True,
                 "excluded_segment": False,
                 "exclusion_reason": "",
@@ -649,8 +779,12 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
             pd.DataFrame(),
             pd.DataFrame(),
             pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
             "",
             "",
+            pd.DataFrame(),
             pd.DataFrame(),
             pd.DataFrame(),
             labels,
@@ -662,6 +796,8 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
     if apply_filter_1day:
         res = res[(res["delta_sec"].isna()) | (res["delta_sec"] < ONE_DAY_SECONDS)].copy()
 
+    res["tiempo_hasta_primera_gestion"] = res["delta_sec_management"].apply(format_duration_exact)
+
     if selected_mode == "Primera llamada saliente":
         res["tiempo_hasta_primera_llamada"] = res["delta_sec"].apply(format_duration_exact)
     else:
@@ -671,13 +807,21 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
 
     res_valid = res[res["excluded_segment"] != True].copy()
     res_with_contact = res_valid[res_valid["has_contact"] == True].copy()
+    res_with_management = res_valid[res_valid["has_management"] == True].copy()
 
     primeras_asignaciones_contacto = res_with_contact[res_with_contact["segment_index"] == 1].copy()
     reasignaciones_contacto = res_with_contact[res_with_contact["segment_index"] > 1].copy()
 
+    primeras_asignaciones_gestion = res_with_management[res_with_management["segment_index"] == 1].copy()
+    reasignaciones_gestion = res_with_management[res_with_management["segment_index"] > 1].copy()
+
     agent_stats = build_agent_summary(res_with_contact, "asignaciones_con_contacto")
     agent_stats_first = build_agent_summary(primeras_asignaciones_contacto, "primeras_asignaciones_con_contacto")
     agent_stats_reassigned = build_agent_summary(reasignaciones_contacto, "reasignaciones_con_contacto")
+
+    agent_stats_management = build_agent_summary_management(res_with_management, "asignaciones_con_gestion")
+    agent_stats_management_first = build_agent_summary_management(primeras_asignaciones_gestion, "primeras_asignaciones_con_gestion")
+    agent_stats_management_reassigned = build_agent_summary_management(reasignaciones_gestion, "reasignaciones_con_gestion")
 
     if not res_with_contact.empty:
         media_total = format_duration_exact(res_with_contact["delta_sec"].mean())
@@ -688,16 +832,21 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
 
     debug_segments_df = pd.concat(debug_segments, ignore_index=True) if debug_segments else pd.DataFrame()
     debug_activities_df = pd.concat(debug_activities, ignore_index=True) if debug_activities else pd.DataFrame()
+    debug_management_df = pd.concat(debug_management_activities, ignore_index=True) if debug_management_activities else pd.DataFrame()
 
     return (
         res,
         agent_stats,
         agent_stats_first,
         agent_stats_reassigned,
+        agent_stats_management,
+        agent_stats_management_first,
+        agent_stats_management_reassigned,
         media_total,
         mediana_total,
         debug_segments_df,
         debug_activities_df,
+        debug_management_df,
         labels,
     )
 
@@ -707,8 +856,12 @@ def to_excel_bytes(
     agent_stats: pd.DataFrame,
     agent_stats_first: pd.DataFrame,
     agent_stats_reassigned: pd.DataFrame,
+    agent_stats_management: pd.DataFrame,
+    agent_stats_management_first: pd.DataFrame,
+    agent_stats_management_reassigned: pd.DataFrame,
     debug_segments: pd.DataFrame,
-    debug_activities: pd.DataFrame
+    debug_activities: pd.DataFrame,
+    debug_management: pd.DataFrame
 ) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -719,10 +872,18 @@ def to_excel_bytes(
             agent_stats_first.to_excel(writer, index=False, sheet_name="agente_primera_asig")
         if len(agent_stats_reassigned) > 0:
             agent_stats_reassigned.to_excel(writer, index=False, sheet_name="agente_reasignacion")
+        if len(agent_stats_management) > 0:
+            agent_stats_management.to_excel(writer, index=False, sheet_name="gestion_por_agente")
+        if len(agent_stats_management_first) > 0:
+            agent_stats_management_first.to_excel(writer, index=False, sheet_name="gestion_primera_asig")
+        if len(agent_stats_management_reassigned) > 0:
+            agent_stats_management_reassigned.to_excel(writer, index=False, sheet_name="gestion_reasignacion")
         if len(debug_segments) > 0:
             debug_segments.to_excel(writer, index=False, sheet_name="debug_segmentos")
         if len(debug_activities) > 0:
             debug_activities.to_excel(writer, index=False, sheet_name="debug_actividades_flow")
+        if len(debug_management) > 0:
+            debug_management.to_excel(writer, index=False, sheet_name="debug_gestion_flow")
     return output.getvalue()
 
 
@@ -747,10 +908,14 @@ if uploaded:
         agent_stats,
         agent_stats_first,
         agent_stats_reassigned,
+        agent_stats_management,
+        agent_stats_management_first,
+        agent_stats_management_reassigned,
         media_total,
         mediana_total,
         debug_segments,
         debug_activities,
+        debug_management,
         labels,
     ) = compute_from_flow(
         df,
@@ -769,64 +934,52 @@ if uploaded:
 
     col1, col2, col3 = st.columns(3)
     col1.metric(labels["metric_count"], f"{len(res[(res['has_contact'] == True) & (res['excluded_segment'] != True)]):,}".replace(",", "."))
-    col2.metric("Media total", media_total)
-    col3.metric("Mediana total", mediana_total)
+    col2.metric("Media total contacto", media_total)
+    col3.metric("Mediana total contacto", mediana_total)
 
-    st.markdown("### 📊 Resumen primera asignación")
+    st.markdown("### 📊 Resumen primera asignación - Contacto")
     c1, c2, c3 = st.columns(3)
-    c1.metric(
-        "Tramos con contacto",
-        f"{len(primeras_asignaciones[primeras_asignaciones['has_contact'] == True]):,}".replace(",", ".")
-    )
-
-    if len(primeras_asignaciones[primeras_asignaciones["has_contact"] == True]) > 0:
-        c2.metric(
-            "Media",
-            format_duration_exact(
-                primeras_asignaciones.loc[
-                    primeras_asignaciones["has_contact"] == True, "delta_sec"
-                ].mean()
-            )
-        )
-        c3.metric(
-            "Mediana",
-            format_duration_exact(
-                primeras_asignaciones.loc[
-                    primeras_asignaciones["has_contact"] == True, "delta_sec"
-                ].median()
-            )
-        )
+    primeras_contacto = primeras_asignaciones[primeras_asignaciones["has_contact"] == True].copy()
+    c1.metric("Tramos con contacto", f"{len(primeras_contacto):,}".replace(",", "."))
+    if len(primeras_contacto) > 0:
+        c2.metric("Media", format_duration_exact(primeras_contacto["delta_sec"].mean()))
+        c3.metric("Mediana", format_duration_exact(primeras_contacto["delta_sec"].median()))
     else:
         c2.metric("Media", "")
         c3.metric("Mediana", "")
 
-    st.markdown("### 📊 Resumen reasignaciones")
+    st.markdown("### 📊 Resumen reasignaciones - Contacto")
     c4, c5, c6 = st.columns(3)
-    c4.metric(
-        "Tramos con contacto",
-        f"{len(reasignaciones[reasignaciones['has_contact'] == True]):,}".replace(",", ".")
-    )
-
-    if len(reasignaciones[reasignaciones["has_contact"] == True]) > 0:
-        c5.metric(
-            "Media",
-            format_duration_exact(
-                reasignaciones.loc[
-                    reasignaciones["has_contact"] == True, "delta_sec"
-                ].mean()
-            )
-        )
-        c6.metric(
-            "Mediana",
-            format_duration_exact(
-                reasignaciones.loc[
-                    reasignaciones["has_contact"] == True, "delta_sec"
-                ].median()
-            )
-        )
+    reasig_contacto = reasignaciones[reasignaciones["has_contact"] == True].copy()
+    c4.metric("Tramos con contacto", f"{len(reasig_contacto):,}".replace(",", "."))
+    if len(reasig_contacto) > 0:
+        c5.metric("Media", format_duration_exact(reasig_contacto["delta_sec"].mean()))
+        c6.metric("Mediana", format_duration_exact(reasig_contacto["delta_sec"].median()))
     else:
         c5.metric("Media", "")
         c6.metric("Mediana", "")
+
+    st.markdown("### 📊 Resumen primera asignación - Gestión")
+    c7, c8, c9 = st.columns(3)
+    primeras_gestion = primeras_asignaciones[primeras_asignaciones["has_management"] == True].copy()
+    c7.metric("Tramos con gestión", f"{len(primeras_gestion):,}".replace(",", "."))
+    if len(primeras_gestion) > 0:
+        c8.metric("Media", format_duration_exact(primeras_gestion["delta_sec_management"].mean()))
+        c9.metric("Mediana", format_duration_exact(primeras_gestion["delta_sec_management"].median()))
+    else:
+        c8.metric("Media", "")
+        c9.metric("Mediana", "")
+
+    st.markdown("### 📊 Resumen reasignaciones - Gestión")
+    c10, c11, c12 = st.columns(3)
+    reasig_gestion = reasignaciones[reasignaciones["has_management"] == True].copy()
+    c10.metric("Tramos con gestión", f"{len(reasig_gestion):,}".replace(",", "."))
+    if len(reasig_gestion) > 0:
+        c11.metric("Media", format_duration_exact(reasig_gestion["delta_sec_management"].mean()))
+        c12.metric("Mediana", format_duration_exact(reasig_gestion["delta_sec_management"].median()))
+    else:
+        c11.metric("Media", "")
+        c12.metric("Mediana", "")
 
     st.subheader(labels["title"])
 
@@ -843,29 +996,54 @@ if uploaded:
         st.info("No hay datos de reasignaciones.")
 
     if len(agent_stats) > 0:
-        st.subheader("👤 Resumen por agente")
+        st.subheader("👤 Resumen por agente - Contacto total")
         st.dataframe(
             agent_stats[["agent_owner", "asignaciones_con_contacto", "media", "mediana"]],
             use_container_width=True
         )
 
     if len(agent_stats_first) > 0:
-        st.subheader("👤 Resumen por agente - Primera asignación")
+        st.subheader("👤 Resumen por agente - Contacto en primera asignación")
         st.dataframe(
             agent_stats_first[["agent_owner", "primeras_asignaciones_con_contacto", "media", "mediana"]],
             use_container_width=True
         )
     else:
-        st.info("No hay datos de primera asignación por agente.")
+        st.info("No hay datos de contacto en primera asignación por agente.")
 
     if len(agent_stats_reassigned) > 0:
-        st.subheader("👤 Resumen por agente - Reasignaciones")
+        st.subheader("👤 Resumen por agente - Contacto en reasignaciones")
         st.dataframe(
             agent_stats_reassigned[["agent_owner", "reasignaciones_con_contacto", "media", "mediana"]],
             use_container_width=True
         )
     else:
-        st.info("No hay datos de reasignaciones por agente.")
+        st.info("No hay datos de contacto en reasignaciones por agente.")
+
+    if len(agent_stats_management) > 0:
+        st.subheader("👤 Resumen por agente - Gestión total")
+        st.dataframe(
+            agent_stats_management[["agent_owner", "asignaciones_con_gestion", "media", "mediana"]],
+            use_container_width=True
+        )
+
+    if len(agent_stats_management_first) > 0:
+        st.subheader("👤 Resumen por agente - Gestión en primera asignación")
+        st.dataframe(
+            agent_stats_management_first[["agent_owner", "primeras_asignaciones_con_gestion", "media", "mediana"]],
+            use_container_width=True
+        )
+    else:
+        st.info("No hay datos de gestión en primera asignación por agente.")
+
+    if len(agent_stats_management_reassigned) > 0:
+        st.subheader("👤 Resumen por agente - Gestión en reasignaciones")
+        st.dataframe(
+            agent_stats_management_reassigned[["agent_owner", "reasignaciones_con_gestion", "media", "mediana"]],
+            use_container_width=True
+        )
+    else:
+        st.info("No hay datos de gestión en reasignaciones por agente.")
 
     excluded_segments = res[res["excluded_segment"] == True].copy()
     if len(excluded_segments) > 0:
@@ -889,22 +1067,35 @@ if uploaded:
         else:
             st.info("No hay segmentos para mostrar.")
 
-    with st.expander("🔎 Debug actividades leídas del flow"):
+    with st.expander("🔎 Debug actividades de contacto leídas del flow"):
         if len(debug_activities) > 0:
             st.dataframe(
                 debug_activities.sort_values(["deal_id", "activity_time"]),
                 use_container_width=True
             )
         else:
-            st.info("No hay actividades del flow para mostrar.")
+            st.info("No hay actividades de contacto para mostrar.")
+
+    with st.expander("🔎 Debug actividades de gestión leídas del flow"):
+        if len(debug_management) > 0:
+            st.dataframe(
+                debug_management.sort_values(["deal_id", "activity_time"]),
+                use_container_width=True
+            )
+        else:
+            st.info("No hay actividades de gestión para mostrar.")
 
     xlsx_bytes = to_excel_bytes(
         res,
         agent_stats,
         agent_stats_first,
         agent_stats_reassigned,
+        agent_stats_management,
+        agent_stats_management_first,
+        agent_stats_management_reassigned,
         debug_segments,
-        debug_activities
+        debug_activities,
+        debug_management
     )
     st.download_button(
         "⬇️ Descargar Excel con resultados",
