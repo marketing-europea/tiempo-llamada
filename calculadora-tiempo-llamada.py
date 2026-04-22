@@ -451,14 +451,14 @@ def build_assignment_segments(
     initial_owner = clean_text(initial_owner)
 
     if initial_owner:
-        rows.append({
-            "deal_id": deal_id,
-            "segment_start": deal_created,
-            "segment_source": "initial_owner_inferred",
-            "from_owner": "",
-            "to_owner": initial_owner,
-            "agent_owner": initial_owner,
-        })
+    rows.append({
+        "deal_id": deal_id,
+        "segment_start": move_to_next_work_moment(deal_created),
+        "segment_source": "initial_owner_inferred",
+        "from_owner": "",
+        "to_owner": initial_owner,
+        "agent_owner": initial_owner,
+    })
 
     for _, ch in owner_changes.iterrows():
         rows.append({
@@ -483,7 +483,7 @@ def build_assignment_segments(
         if owner_at_reopen:
             rows.append({
                 "deal_id": deal_id,
-                "segment_start": rp_time,
+                "segment_start": move_to_next_work_moment(rp_time),
                 "segment_source": "reopened",
                 "from_owner": "",
                 "to_owner": owner_at_reopen,
