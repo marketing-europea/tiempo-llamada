@@ -12,8 +12,8 @@ st.title("📞 Primera llamada por asignación usando Flow de Pipedrive")
 st.write(
     "Sube un Excel para obtener los negocios a analizar. "
     "La app usa el flow API de Pipedrive como fuente de verdad para reconstruir "
-    "reasignaciones y actividades, y calcula la primera llamada/contacto "
-    "tras cada asignación real de propietario."
+    "reasignaciones, estados, etapas y actividades, "
+    "y calcula la primera llamada/contacto tras cada asignación real."
 )
 
 uploaded = st.file_uploader("Sube tu Excel (.xlsx)", type=["xlsx"])
@@ -217,12 +217,8 @@ def extract_reopen_events(flow_json: dict) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("event_time").reset_index(drop=True)
 
 
-def extract_first_lead_to_advanced_stage(flow_json: dict):
-    """
-    Detecta la primera salida desde Lead a cualquier otra etapa
-    (Contacto, Presupuesto, etc.)
-    """
-    changes = []
+def extract_stage_changes_from_lead(flow_json: dict) -> pd.DataFrame:
+    rows = []
 
     for item in flow_json.get("data", []) or []:
         if item.get("object") != "dealChange":
@@ -242,17 +238,16 @@ def extract_first_lead_to_advanced_stage(flow_json: dict):
         if old_stage_norm == "lead" and new_stage_norm not in {"", "lead"}:
             ts = to_madrid_ts(data.get("log_time"))
             if pd.notna(ts):
-                changes.append({
+                rows.append({
                     "stage_change_time": ts,
                     "old_stage": old_stage,
                     "new_stage": new_stage,
                 })
 
-    if not changes:
-        return pd.NaT, "", ""
+    if not rows:
+        return pd.DataFrame(columns=["stage_change_time", "old_stage", "new_stage"])
 
-    first_change = sorted(changes, key=lambda x: x["stage_change_time"])[0]
-    return first_change["stage_change_time"], first_change["old_stage"], first_change["new_stage"]
+    return pd.DataFrame(rows).sort_values("stage_change_time").reset_index(drop=True)
 
 
 def extract_flow_activities(flow_json: dict, selected_mode: str) -> pd.DataFrame:
@@ -301,14 +296,6 @@ def extract_flow_activities(flow_json: dict, selected_mode: str) -> pd.DataFrame
     return pd.DataFrame(rows).sort_values("activity_time").reset_index(drop=True)
 
 
-def has_contact_before_stage_change(flow_activities: pd.DataFrame, stage_change_time: pd.Timestamp) -> bool:
-    if flow_activities.empty or pd.isna(stage_change_time):
-        return False
-
-    prior = flow_activities[flow_activities["activity_time"] < stage_change_time].copy()
-    return len(prior) > 0
-
-
 def build_assignment_segments(
     deal_id: int,
     deal_created: pd.Timestamp,
@@ -317,7 +304,6 @@ def build_assignment_segments(
 ) -> pd.DataFrame:
     rows = []
 
-    # Solo asignaciones reales
     for _, ch in owner_changes.iterrows():
         rows.append({
             "deal_id": deal_id,
@@ -328,7 +314,6 @@ def build_assignment_segments(
             "agent_owner": ch["new_owner"],
         })
 
-    # Reaperturas: si ya había owner asignado, abrimos bloque nuevo en esa reapertura
     for _, rp in reopen_events.iterrows():
         rp_time = rp["event_time"]
 
@@ -420,7 +405,6 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
     rows = []
     debug_segments = []
     debug_activities = []
-    excluded_stage_without_contact = []
 
     deal_ids = (
         pd.to_numeric(deals_df[COL_DEAL_ID], errors="coerce")
@@ -463,6 +447,8 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                 "first_contact_subject": "",
                 "delta_sec": float("nan"),
                 "has_contact": False,
+                "excluded_segment": False,
+                "exclusion_reason": "",
                 "flow_error": str(e),
             })
             progress.progress(i / total if total else 1)
@@ -471,24 +457,8 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
         deal_created = extract_created_time_from_flow(flow_json, fallback_created)
         owner_changes = extract_owner_changes(flow_json)
         reopen_events = extract_reopen_events(flow_json)
+        stage_changes_from_lead = extract_stage_changes_from_lead(flow_json)
         flow_activities = extract_flow_activities(flow_json, selected_mode)
-
-        first_stage_change_time, old_stage, new_stage = extract_first_lead_to_advanced_stage(flow_json)
-
-        if pd.notna(first_stage_change_time):
-            had_contact_before = has_contact_before_stage_change(flow_activities, first_stage_change_time)
-
-            if not had_contact_before:
-                excluded_stage_without_contact.append({
-                    "deal_id": deal_id,
-                    "deal_created": deal_created,
-                    "first_stage_change_time": first_stage_change_time,
-                    "old_stage": old_stage,
-                    "new_stage": new_stage,
-                    "motivo_exclusion": f"Pasa de {old_stage} a {new_stage} sin contacto previo en flow",
-                })
-                progress.progress(i / total if total else 1)
-                continue
 
         segments = build_assignment_segments(
             deal_id=deal_id,
@@ -522,9 +492,27 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
             from_owner = seg["from_owner"]
             to_owner = seg["to_owner"]
 
-            # start exacto de la asignación
             segment_start_adjusted = segment_start
             effective_start = segment_start_adjusted - pd.Timedelta(seconds=OWNER_CHANGE_TOLERANCE_SECONDS)
+
+            segment_stage_changes = stage_changes_from_lead[
+                stage_changes_from_lead["stage_change_time"] >= segment_start
+            ].copy()
+
+            if pd.notna(segment_end):
+                segment_stage_changes = segment_stage_changes[
+                    segment_stage_changes["stage_change_time"] < segment_end
+                ].copy()
+
+            first_stage_change_in_segment = pd.NaT
+            first_stage_old = ""
+            first_stage_new = ""
+
+            if not segment_stage_changes.empty:
+                first_stage_row = segment_stage_changes.iloc[0]
+                first_stage_change_in_segment = first_stage_row["stage_change_time"]
+                first_stage_old = first_stage_row["old_stage"]
+                first_stage_new = first_stage_row["new_stage"]
 
             candidate = flow_activities[
                 (flow_activities["real_owner"] == agent_owner) &
@@ -537,6 +525,29 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
             candidate = candidate.sort_values(["activity_time", "activity_subject"])
 
             if candidate.empty:
+                if pd.notna(first_stage_change_in_segment):
+                    rows.append({
+                        "deal_id": deal_id,
+                        "segment_index": seg_idx + 1,
+                        "segment_source": seg["segment_source"],
+                        "from_owner": from_owner,
+                        "to_owner": to_owner,
+                        "agent_owner": agent_owner,
+                        "deal_created": deal_created,
+                        "segment_start": segment_start,
+                        "segment_start_adjusted": segment_start_adjusted,
+                        "segment_end": segment_end,
+                        "effective_start": effective_start,
+                        "first_contact_time": pd.NaT,
+                        "first_contact_subject": "",
+                        "delta_sec": float("nan"),
+                        "has_contact": False,
+                        "excluded_segment": True,
+                        "exclusion_reason": f"Sale de {first_stage_old} a {first_stage_new} sin contacto tras la asignación",
+                        "flow_error": "",
+                    })
+                    continue
+
                 rows.append({
                     "deal_id": deal_id,
                     "segment_index": seg_idx + 1,
@@ -553,6 +564,8 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                     "first_contact_subject": "",
                     "delta_sec": float("nan"),
                     "has_contact": False,
+                    "excluded_segment": False,
+                    "exclusion_reason": "",
                     "flow_error": "",
                 })
                 continue
@@ -560,6 +573,29 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
             first_contact = candidate.iloc[0]
             first_contact_time = first_contact["activity_time"]
             first_contact_subject = first_contact["activity_subject"]
+
+            if pd.notna(first_stage_change_in_segment) and first_stage_change_in_segment <= first_contact_time:
+                rows.append({
+                    "deal_id": deal_id,
+                    "segment_index": seg_idx + 1,
+                    "segment_source": seg["segment_source"],
+                    "from_owner": from_owner,
+                    "to_owner": to_owner,
+                    "agent_owner": agent_owner,
+                    "deal_created": deal_created,
+                    "segment_start": segment_start,
+                    "segment_start_adjusted": segment_start_adjusted,
+                    "segment_end": segment_end,
+                    "effective_start": effective_start,
+                    "first_contact_time": pd.NaT,
+                    "first_contact_subject": "",
+                    "delta_sec": float("nan"),
+                    "has_contact": False,
+                    "excluded_segment": True,
+                    "exclusion_reason": f"Sale de {first_stage_old} a {first_stage_new} antes del primer contacto del tramo",
+                    "flow_error": "",
+                })
+                continue
 
             if first_contact_time < segment_start_adjusted:
                 delta_sec = 0.0
@@ -582,6 +618,8 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                 "first_contact_subject": first_contact_subject,
                 "delta_sec": delta_sec,
                 "has_contact": True,
+                "excluded_segment": False,
+                "exclusion_reason": "",
                 "flow_error": "",
             })
 
@@ -597,9 +635,11 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
             "",
             pd.DataFrame(),
             pd.DataFrame(),
-            pd.DataFrame(excluded_stage_without_contact),
             labels,
         )
+
+    if "excluded_segment" not in res.columns:
+        res["excluded_segment"] = False
 
     if apply_filter_1day:
         res = res[(res["delta_sec"].isna()) | (res["delta_sec"] < ONE_DAY_SECONDS)].copy()
@@ -610,7 +650,9 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
         res["tiempo_hasta_primer_contacto"] = res["delta_sec"].apply(format_duration_exact)
 
     res = res.sort_values(["deal_id", "segment_start"]).reset_index(drop=True)
-    res_with_contact = res[res["has_contact"] == True].copy()
+
+    res_valid = res[res["excluded_segment"] != True].copy()
+    res_with_contact = res_valid[res_valid["has_contact"] == True].copy()
 
     if not res_with_contact.empty:
         agent_stats = (
@@ -635,26 +677,15 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
 
     debug_segments_df = pd.concat(debug_segments, ignore_index=True) if debug_segments else pd.DataFrame()
     debug_activities_df = pd.concat(debug_activities, ignore_index=True) if debug_activities else pd.DataFrame()
-    excluded_df = pd.DataFrame(excluded_stage_without_contact)
 
-    return (
-        res,
-        agent_stats,
-        media_total,
-        mediana_total,
-        debug_segments_df,
-        debug_activities_df,
-        excluded_df,
-        labels,
-    )
+    return res, agent_stats, media_total, mediana_total, debug_segments_df, debug_activities_df, labels
 
 
 def to_excel_bytes(
     res: pd.DataFrame,
     agent_stats: pd.DataFrame,
     debug_segments: pd.DataFrame,
-    debug_activities: pd.DataFrame,
-    excluded_df: pd.DataFrame
+    debug_activities: pd.DataFrame
 ) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -665,8 +696,6 @@ def to_excel_bytes(
             debug_segments.to_excel(writer, index=False, sheet_name="debug_segmentos")
         if len(debug_activities) > 0:
             debug_activities.to_excel(writer, index=False, sheet_name="debug_actividades_flow")
-        if len(excluded_df) > 0:
-            excluded_df.to_excel(writer, index=False, sheet_name="excluidos_sin_contacto")
     return output.getvalue()
 
 
@@ -686,27 +715,20 @@ if uploaded:
         st.warning("Necesitas API token y subdominio para reconstruir el timeline real desde flow.")
         st.stop()
 
-    (
-        res,
-        agent_stats,
-        media_total,
-        mediana_total,
-        debug_segments,
-        debug_activities,
-        excluded_df,
-        labels,
-    ) = compute_from_flow(
+    res, agent_stats, media_total, mediana_total, debug_segments, debug_activities, labels = compute_from_flow(
         df,
         apply_filter_1day,
         contact_mode
     )
 
     res_to_show = res.copy()
+    res_to_show = res_to_show[res_to_show["excluded_segment"] != True].copy()
+
     if hide_segments_without_contact and len(res_to_show) > 0:
         res_to_show = res_to_show[res_to_show["has_contact"] == True].copy()
 
     col1, col2, col3 = st.columns(3)
-    col1.metric(labels["metric_count"], f"{len(res[res['has_contact'] == True]):,}".replace(",", "."))
+    col1.metric(labels["metric_count"], f"{len(res[(res['has_contact'] == True) & (res['excluded_segment'] != True)]):,}".replace(",", "."))
     col2.metric("Media total", media_total)
     col3.metric("Mediana total", mediana_total)
 
@@ -720,9 +742,18 @@ if uploaded:
             use_container_width=True
         )
 
-    if len(excluded_df) > 0:
-        st.subheader("⚠️ Deals excluidos: pasan de Lead a otra etapa sin contacto previo")
-        st.dataframe(excluded_df, use_container_width=True)
+    excluded_segments = res[res["excluded_segment"] == True].copy()
+    if len(excluded_segments) > 0:
+        st.subheader("⚠️ Tramos excluidos del cálculo")
+        st.dataframe(
+            excluded_segments[
+                [
+                    "deal_id", "segment_index", "segment_source", "from_owner", "to_owner",
+                    "agent_owner", "segment_start", "segment_end", "exclusion_reason"
+                ]
+            ],
+            use_container_width=True
+        )
 
     with st.expander("🔎 Debug segmentos reconstruidos desde flow"):
         if len(debug_segments) > 0:
@@ -742,13 +773,7 @@ if uploaded:
         else:
             st.info("No hay actividades del flow para mostrar.")
 
-    xlsx_bytes = to_excel_bytes(
-        res,
-        agent_stats,
-        debug_segments,
-        debug_activities,
-        excluded_df
-    )
+    xlsx_bytes = to_excel_bytes(res, agent_stats, debug_segments, debug_activities)
     st.download_button(
         "⬇️ Descargar Excel con resultados",
         data=xlsx_bytes,
