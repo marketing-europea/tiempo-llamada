@@ -39,6 +39,11 @@ only_direct_outgoing_after_first_assignment = st.checkbox(
     value=False
 )
 
+exclude_contact_preference_notes = st.checkbox(
+    "Excluir leads con nota de preferencia de contacto (ej. 'quiere ser contactado...')",
+    value=False
+)
+
 st.subheader("🔐 Configuración API Pipedrive")
 api_token = st.text_input("API token", type="password")
 company_domain = st.text_input("Subdominio de Pipedrive", placeholder="tuempresa")
@@ -124,10 +129,6 @@ def get_contact_pattern(selected_mode: str) -> str:
     return r"llamada saliente|whatsapp chat"
 
 
-def get_management_pattern() -> str:
-    return r"recordatorio agente|lead pendiente de llamar|llamada de seguimiento|recordatorio|pendiente de llamar|llamada saliente|whatsapp chat"
-
-
 def get_result_labels(selected_mode: str):
     if selected_mode == "Primera llamada saliente":
         return {
@@ -144,13 +145,39 @@ def get_result_labels(selected_mode: str):
     }
 
 
+def is_contact_preference_note(text: str) -> bool:
+    text = clean_text(text).lower()
+
+    patterns = [
+        "quiere ser contactado",
+        "quiere ser contactada",
+        "prefiere que le llamen",
+        "prefiere contacto",
+        "horario de mañana",
+        "horario de tarde",
+        "mediante whatsapp",
+        "contactar por whatsapp",
+        "contactar por la mañana",
+        "contactar por la tarde",
+    ]
+    return any(p in text for p in patterns)
+
+
 def classify_activity(subject: str, type_name: str, activity_type: str) -> str:
     text = f"{clean_text(subject)} {clean_text(type_name)} {clean_text(activity_type)}".lower()
 
     if "llamada saliente" in text:
         return "outgoing_call"
-    if "whatsapp chat" in text:
+    if "whatsapp chat" in text or "whatsapp" in text:
         return "whatsapp"
+    if "email" in text or "correo" in text or "mail" in text:
+        return "email"
+    if "sms" in text:
+        return "sms"
+    if "nota" in text or "note" in text:
+        return "note"
+    if "tarea" in text or "task" in text:
+        return "task"
     if (
         "recordatorio agente" in text
         or "lead pendiente de llamar" in text
@@ -283,7 +310,6 @@ def extract_flow_contact_activities(flow_json: dict, selected_mode: str) -> pd.D
 
         data = item.get("data", {}) or {}
         subject = clean_text(data.get("subject"))
-
         if not subject:
             continue
 
@@ -322,7 +348,6 @@ def extract_flow_contact_activities(flow_json: dict, selected_mode: str) -> pd.D
 
 def extract_flow_management_activities(flow_json: dict) -> pd.DataFrame:
     rows = []
-    pattern = get_management_pattern()
 
     for item in flow_json.get("data", []) or []:
         if item.get("object") != "activity":
@@ -333,12 +358,10 @@ def extract_flow_management_activities(flow_json: dict) -> pd.DataFrame:
         type_name = clean_text(data.get("type_name"))
         activity_type = clean_text(data.get("type"))
 
-        text_to_check = f"{subject} {type_name} {activity_type}"
+        activity_class = classify_activity(subject, type_name, activity_type)
 
-        if not text_to_check:
-            continue
-
-        if not pd.Series([text_to_check]).str.contains(pattern, case=False, na=False).iloc[0]:
+        # Gestión = toda actividad relevante que NO sea llamada
+        if activity_class not in {"whatsapp", "email", "sms", "note", "task", "management_other"}:
             continue
 
         activity_time = get_activity_datetime_local(data)
@@ -355,12 +378,14 @@ def extract_flow_management_activities(flow_json: dict) -> pd.DataFrame:
             "owner_name": clean_text(data.get("owner_name")),
             "assigned_to_user_id": data.get("assigned_to_user_id"),
             "user_id": data.get("user_id"),
+            "activity_class": activity_class,
         })
 
     if not rows:
         return pd.DataFrame(columns=[
             "activity_time", "activity_subject", "activity_id", "activity_type",
-            "type_name", "activity_done", "owner_name", "assigned_to_user_id", "user_id"
+            "type_name", "activity_done", "owner_name", "assigned_to_user_id",
+            "user_id", "activity_class"
         ])
 
     return pd.DataFrame(rows).sort_values("activity_time").reset_index(drop=True)
@@ -569,7 +594,8 @@ def compute_from_flow(
     deals_df: pd.DataFrame,
     apply_filter_1day: bool,
     selected_mode: str,
-    only_direct_outgoing_after_first_assignment: bool
+    only_direct_outgoing_after_first_assignment: bool,
+    exclude_contact_preference_notes: bool
 ):
     labels = get_result_labels(selected_mode)
 
@@ -650,6 +676,19 @@ def compute_from_flow(
             reopen_events=reopen_events
         )
 
+        has_contact_preference = False
+        for item in flow_json.get("data", []) or []:
+            if item.get("object") != "activity":
+                continue
+            data = item.get("data", {}) or {}
+            subject = clean_text(data.get("subject"))
+            type_name = clean_text(data.get("type_name"))
+            activity_type = clean_text(data.get("type"))
+            text = f"{subject} {type_name} {activity_type}"
+            if is_contact_preference_note(text):
+                has_contact_preference = True
+                break
+
         if not segments.empty:
             seg_dbg = segments.copy()
             seg_dbg["deal_id"] = deal_id
@@ -677,6 +716,39 @@ def compute_from_flow(
             debug_relevant_activities.append(r_dbg)
 
         if segments.empty:
+            progress.progress(i / total if total else 1)
+            continue
+
+        if exclude_contact_preference_notes and has_contact_preference:
+            for seg_idx, seg in segments.iterrows():
+                rows.append({
+                    "deal_id": deal_id,
+                    "segment_index": seg_idx + 1,
+                    "segment_source": seg["segment_source"],
+                    "from_owner": seg["from_owner"],
+                    "to_owner": seg["to_owner"],
+                    "agent_owner": seg["agent_owner"],
+                    "deal_created": deal_created,
+                    "segment_start": seg["segment_start"],
+                    "segment_start_adjusted": seg["segment_start"],
+                    "segment_end": seg["segment_end"],
+                    "effective_start": pd.NaT,
+                    "first_relevant_activity_time": pd.NaT,
+                    "first_relevant_activity_subject": "",
+                    "first_relevant_activity_class": "",
+                    "direct_outgoing_after_assignment": False,
+                    "first_management_time": pd.NaT,
+                    "first_management_subject": "",
+                    "delta_sec_management": float("nan"),
+                    "first_contact_time": pd.NaT,
+                    "first_contact_subject": "",
+                    "delta_sec": float("nan"),
+                    "has_management": False,
+                    "has_contact": False,
+                    "excluded_segment": True,
+                    "exclusion_reason": "Lead con preferencia de contacto (nota)",
+                    "flow_error": "",
+                })
             progress.progress(i / total if total else 1)
             continue
 
@@ -771,7 +843,9 @@ def compute_from_flow(
             ].copy()
 
             if pd.notna(segment_end):
-                contact_candidate = contact_candidate[contact_candidate["activity_time"] < segment_end].copy()
+                contact_candidate = contact_candidate[
+                    contact_candidate["activity_time"] < segment_end
+                ].copy()
 
             contact_candidate = contact_candidate.sort_values(["activity_time", "activity_subject"])
 
@@ -980,7 +1054,9 @@ def compute_from_flow(
 
     return (
         res,
-        pd.concat([agent_summary_first, agent_summary_reassigned], ignore_index=True) if (not agent_summary_first.empty or not agent_summary_reassigned.empty) else pd.DataFrame(),
+        pd.concat([agent_summary_first, agent_summary_reassigned], ignore_index=True)
+        if (not agent_summary_first.empty or not agent_summary_reassigned.empty)
+        else pd.DataFrame(),
         media_total,
         mediana_total,
         debug_segments_df,
@@ -1045,16 +1121,17 @@ if uploaded:
         df,
         apply_filter_1day,
         contact_mode,
-        only_direct_outgoing_after_first_assignment
+        only_direct_outgoing_after_first_assignment,
+        exclude_contact_preference_notes
     )
-    
+
     total_unique_leads = df[COL_DEAL_ID].dropna().nunique()
 
     leads_first_assignment_direct_call = res[
-    (res["segment_index"] == 1) &
-    (res["direct_outgoing_after_assignment"] == True) &
-    (res["has_contact"] == True) &
-    (res["excluded_segment"] != True)
+        (res["segment_index"] == 1) &
+        (res["direct_outgoing_after_assignment"] == True) &
+        (res["has_contact"] == True) &
+        (res["excluded_segment"] != True)
     ]["deal_id"].dropna().nunique()
 
     res_to_show = res.copy()
