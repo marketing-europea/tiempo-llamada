@@ -1,4 +1,5 @@
 import io
+import re
 import requests
 import pandas as pd
 import streamlit as st
@@ -10,13 +11,15 @@ st.set_page_config(
 
 st.title("📞 Primera gestión y contacto por asignación usando Flow de Pipedrive")
 st.write(
-    "Sube un Excel para obtener los negocios a analizar. "
+    "Sube un Excel principal con los negocios a analizar. "
+    "Opcionalmente, puedes subir también un Excel de notas exportado de Pipedrive. "
     "La app usa el flow API de Pipedrive como fuente de verdad para reconstruir "
-    "reasignaciones, estados, etapas y actividades, "
-    "y calcula la primera gestión y el primer contacto tras cada asignación real."
+    "reasignaciones, estados, etapas y actividades, y calcula la primera gestión "
+    "y el primer contacto tras cada asignación real."
 )
 
-uploaded = st.file_uploader("Sube tu Excel (.xlsx)", type=["xlsx"])
+uploaded = st.file_uploader("Sube tu Excel principal (.xlsx)", type=["xlsx"])
+uploaded_notes = st.file_uploader("Sube el Excel de notas (.xlsx) - opcional", type=["xlsx"], key="notes_file")
 
 contact_mode = st.radio(
     "Qué quieres medir como contacto",
@@ -40,7 +43,7 @@ only_direct_outgoing_after_first_assignment = st.checkbox(
 )
 
 exclude_contact_preference_notes = st.checkbox(
-    "Excluir leads con nota de preferencia de contacto (ej. 'quiere ser contactado...')",
+    "Excluir leads que tienen nota de preferencia de contacto en el Excel de notas",
     value=False
 )
 
@@ -50,6 +53,10 @@ company_domain = st.text_input("Subdominio de Pipedrive", placeholder="tuempresa
 
 COL_DEAL_ID = "Negocio - ID"
 COL_CREATED = "Negocio - Negocio creado el"
+
+NOTES_DEAL_ID_COL = "Nota - ID de negocio"
+NOTES_CONTENT_COL = "Nota - Contenido"
+NOTES_CREATED_COL = "Nota - Añadir hora"
 
 ONE_DAY_SECONDS = 86400
 OWNER_CHANGE_TOLERANCE_SECONDS = 60
@@ -62,6 +69,15 @@ def clean_text(value) -> str:
     return str(value).strip()
 
 
+def strip_html(text: str) -> str:
+    text = clean_text(text)
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def to_madrid_ts(value):
     if value in (None, "", pd.NaT):
         return pd.NaT
@@ -69,6 +85,23 @@ def to_madrid_ts(value):
     if pd.isna(ts):
         return pd.NaT
     return ts.tz_convert(LOCAL_TIMEZONE).tz_localize(None)
+
+
+def parse_local_ts(value):
+    if value in (None, "", pd.NaT):
+        return pd.NaT
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return pd.NaT
+    if getattr(ts, "tzinfo", None) is not None:
+        try:
+            return ts.tz_convert(LOCAL_TIMEZONE).tz_localize(None)
+        except Exception:
+            try:
+                return ts.tz_localize(None)
+            except Exception:
+                return ts
+    return ts
 
 
 def get_activity_datetime_local(activity_data: dict) -> pd.Timestamp:
@@ -146,7 +179,7 @@ def get_result_labels(selected_mode: str):
 
 
 def is_contact_preference_note(text: str) -> bool:
-    text = clean_text(text).lower()
+    text = strip_html(text).lower()
 
     patterns = [
         "quiere ser contactado",
@@ -156,6 +189,7 @@ def is_contact_preference_note(text: str) -> bool:
         "horario de mañana",
         "horario de tarde",
         "mediante whatsapp",
+        "mediante llamada",
         "contactar por whatsapp",
         "contactar por la mañana",
         "contactar por la tarde",
@@ -168,16 +202,8 @@ def classify_activity(subject: str, type_name: str, activity_type: str) -> str:
 
     if "llamada saliente" in text:
         return "outgoing_call"
-    if "whatsapp chat" in text or "whatsapp" in text:
+    if "whatsapp chat" in text:
         return "whatsapp"
-    if "email" in text or "correo" in text or "mail" in text:
-        return "email"
-    if "sms" in text:
-        return "sms"
-    if "nota" in text or "note" in text:
-        return "note"
-    if "tarea" in text or "task" in text:
-        return "task"
     if (
         "recordatorio agente" in text
         or "lead pendiente de llamar" in text
@@ -188,6 +214,36 @@ def classify_activity(subject: str, type_name: str, activity_type: str) -> str:
         return "management_other"
 
     return ""
+
+
+@st.cache_data(show_spinner=False)
+def extract_contact_preference_notes_from_excel(notes_file_bytes: bytes) -> tuple[pd.DataFrame, set]:
+    df_notes = pd.read_excel(io.BytesIO(notes_file_bytes))
+
+    if NOTES_DEAL_ID_COL not in df_notes.columns or NOTES_CONTENT_COL not in df_notes.columns:
+        return pd.DataFrame(), set()
+
+    work = df_notes.copy()
+    work[NOTES_DEAL_ID_COL] = pd.to_numeric(work[NOTES_DEAL_ID_COL], errors="coerce").astype("Int64")
+    work["nota_texto_limpio"] = work[NOTES_CONTENT_COL].apply(strip_html)
+    work["es_nota_preferencia_contacto"] = work["nota_texto_limpio"].apply(is_contact_preference_note)
+
+    if NOTES_CREATED_COL in work.columns:
+        work["nota_add_time_local"] = work[NOTES_CREATED_COL].apply(parse_local_ts)
+    else:
+        work["nota_add_time_local"] = pd.NaT
+
+    matched = work[
+        work["es_nota_preferencia_contacto"] == True
+    ].copy()
+
+    matched = matched.dropna(subset=[NOTES_DEAL_ID_COL]).copy()
+
+    deal_ids = set(
+        matched[NOTES_DEAL_ID_COL].dropna().astype(int).tolist()
+    )
+
+    return matched, deal_ids
 
 
 def extract_created_time_from_flow(flow_json: dict, fallback_created: pd.Timestamp) -> pd.Timestamp:
@@ -310,6 +366,7 @@ def extract_flow_contact_activities(flow_json: dict, selected_mode: str) -> pd.D
 
         data = item.get("data", {}) or {}
         subject = clean_text(data.get("subject"))
+
         if not subject:
             continue
 
@@ -360,8 +417,7 @@ def extract_flow_management_activities(flow_json: dict) -> pd.DataFrame:
 
         activity_class = classify_activity(subject, type_name, activity_type)
 
-        # Gestión = toda actividad relevante que NO sea llamada
-        if activity_class not in {"whatsapp", "email", "sms", "note", "task", "management_other"}:
+        if activity_class not in {"whatsapp", "management_other"}:
             continue
 
         activity_time = get_activity_datetime_local(data)
@@ -592,6 +648,8 @@ def build_agent_dual_summary(df_management: pd.DataFrame, df_contact: pd.DataFra
 
 def compute_from_flow(
     deals_df: pd.DataFrame,
+    notes_pref_df: pd.DataFrame,
+    note_pref_deal_ids: set,
     apply_filter_1day: bool,
     selected_mode: str,
     only_direct_outgoing_after_first_assignment: bool,
@@ -656,6 +714,7 @@ def compute_from_flow(
                 "has_contact": False,
                 "excluded_segment": False,
                 "exclusion_reason": "",
+                "contact_preference_text": "",
                 "flow_error": str(e),
             })
             progress.progress(i / total if total else 1)
@@ -676,29 +735,18 @@ def compute_from_flow(
             reopen_events=reopen_events
         )
 
-        has_contact_preference = False
+        deal_notes_pref = pd.DataFrame()
+        if not notes_pref_df.empty:
+            deal_notes_pref = notes_pref_df[
+                pd.to_numeric(notes_pref_df[NOTES_DEAL_ID_COL], errors="coerce") == deal_id
+            ].copy()
+
+        has_contact_preference = deal_id in note_pref_deal_ids
         contact_preference_text = ""
-
-    for item in flow_json.get("data", []) or []:
-        obj = clean_text(item.get("object")).lower()
-        data = item.get("data", {}) or {}
-
-        candidate_texts = [
-        clean_text(data.get("subject")),
-        clean_text(data.get("content")),
-        clean_text(data.get("note")),
-        clean_text(data.get("title")),
-        clean_text(data.get("type_name")),
-        clean_text(data.get("type")),
-        clean_text(data.get("description")),
-    ]
-
-        full_text = " | ".join([t for t in candidate_texts if t])
-
-        if is_contact_preference_note(full_text):
-            has_contact_preference = True
-            contact_preference_text = full_text
-        break
+        if not deal_notes_pref.empty:
+            contact_preference_text = " || ".join(
+                deal_notes_pref["nota_texto_limpio"].dropna().astype(str).tolist()[:5]
+            )
 
         if not segments.empty:
             seg_dbg = segments.copy()
@@ -757,7 +805,8 @@ def compute_from_flow(
                     "has_management": False,
                     "has_contact": False,
                     "excluded_segment": True,
-                    "exclusion_reason": "Lead con preferencia de contacto (nota)",
+                    "exclusion_reason": "Lead con preferencia de contacto (nota en Excel de notas)",
+                    "contact_preference_text": contact_preference_text,
                     "flow_error": "",
                 })
             progress.progress(i / total if total else 1)
@@ -854,9 +903,7 @@ def compute_from_flow(
             ].copy()
 
             if pd.notna(segment_end):
-                contact_candidate = contact_candidate[
-                    contact_candidate["activity_time"] < segment_end
-                ].copy()
+                contact_candidate = contact_candidate[contact_candidate["activity_time"] < segment_end].copy()
 
             contact_candidate = contact_candidate.sort_values(["activity_time", "activity_subject"])
 
@@ -888,6 +935,7 @@ def compute_from_flow(
                         "has_contact": False,
                         "excluded_segment": True,
                         "exclusion_reason": f"Sale de {first_stage_old} a {first_stage_new} sin contacto tras la asignación",
+                        "contact_preference_text": contact_preference_text,
                         "flow_error": "",
                     })
                     continue
@@ -918,6 +966,7 @@ def compute_from_flow(
                     "has_contact": False,
                     "excluded_segment": False,
                     "exclusion_reason": "",
+                    "contact_preference_text": contact_preference_text,
                     "flow_error": "",
                 })
                 continue
@@ -953,6 +1002,7 @@ def compute_from_flow(
                     "has_contact": False,
                     "excluded_segment": True,
                     "exclusion_reason": f"Sale de {first_stage_old} a {first_stage_new} antes del primer contacto del tramo",
+                    "contact_preference_text": contact_preference_text,
                     "flow_error": "",
                 })
                 continue
@@ -988,6 +1038,7 @@ def compute_from_flow(
                 "has_contact": True,
                 "excluded_segment": False,
                 "exclusion_reason": "",
+                "contact_preference_text": contact_preference_text,
                 "flow_error": "",
             })
 
@@ -1065,9 +1116,7 @@ def compute_from_flow(
 
     return (
         res,
-        pd.concat([agent_summary_first, agent_summary_reassigned], ignore_index=True)
-        if (not agent_summary_first.empty or not agent_summary_reassigned.empty)
-        else pd.DataFrame(),
+        pd.concat([agent_summary_first, agent_summary_reassigned], ignore_index=True) if (not agent_summary_first.empty or not agent_summary_reassigned.empty) else pd.DataFrame(),
         media_total,
         mediana_total,
         debug_segments_df,
@@ -1084,7 +1133,8 @@ def to_excel_bytes(
     debug_segments: pd.DataFrame,
     debug_contact: pd.DataFrame,
     debug_management: pd.DataFrame,
-    debug_relevant: pd.DataFrame
+    debug_relevant: pd.DataFrame,
+    notes_pref_df: pd.DataFrame
 ) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1099,6 +1149,8 @@ def to_excel_bytes(
             debug_management.to_excel(writer, index=False, sheet_name="debug_gestion_flow")
         if len(debug_relevant) > 0:
             debug_relevant.to_excel(writer, index=False, sheet_name="debug_eventos_relevantes")
+        if len(notes_pref_df) > 0:
+            notes_pref_df.to_excel(writer, index=False, sheet_name="debug_notas_preferencia")
     return output.getvalue()
 
 
@@ -1106,13 +1158,23 @@ if uploaded:
     try:
         df = pd.read_excel(uploaded)
     except Exception as e:
-        st.error(f"No he podido leer el Excel: {e}")
+        st.error(f"No he podido leer el Excel principal: {e}")
         st.stop()
 
     if COL_DEAL_ID not in df.columns:
         st.error(f"Falta la columna necesaria: {COL_DEAL_ID}")
         st.write("Columnas detectadas:", list(df.columns))
         st.stop()
+
+    notes_pref_df = pd.DataFrame()
+    note_pref_deal_ids = set()
+
+    if uploaded_notes is not None:
+        try:
+            notes_pref_df, note_pref_deal_ids = extract_contact_preference_notes_from_excel(uploaded_notes.getvalue())
+        except Exception as e:
+            st.error(f"No he podido leer el Excel de notas: {e}")
+            st.stop()
 
     if not api_token or not company_domain:
         st.warning("Necesitas API token y subdominio para reconstruir el timeline real desde flow.")
@@ -1130,6 +1192,8 @@ if uploaded:
         labels,
     ) = compute_from_flow(
         df,
+        notes_pref_df,
+        note_pref_deal_ids,
         apply_filter_1day,
         contact_mode,
         only_direct_outgoing_after_first_assignment,
@@ -1145,13 +1209,15 @@ if uploaded:
         (res["excluded_segment"] != True)
     ]["deal_id"].dropna().nunique()
 
+    leads_with_contact_preference_note = len(note_pref_deal_ids)
+
     res_to_show = res.copy()
     res_to_show = res_to_show[res_to_show["excluded_segment"] != True].copy()
 
     if hide_segments_without_contact and len(res_to_show) > 0:
         res_to_show = res_to_show[res_to_show["has_contact"] == True].copy()
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     col1.metric(
         "Leads únicos",
@@ -1159,17 +1225,39 @@ if uploaded:
     )
 
     col2.metric(
+        "Leads con nota preferencia",
+        f"{leads_with_contact_preference_note:,}".replace(",", ".")
+    )
+
+    col3.metric(
         "Leads con llamada tras 1ª asignación",
         f"{leads_first_assignment_direct_call:,}".replace(",", ".")
     )
 
-    col3.metric(
+    col4.metric(
         labels["metric_count"],
         f"{len(res[(res['has_contact'] == True) & (res['excluded_segment'] != True)]):,}".replace(",", ".")
     )
 
-    col4.metric("Media total contacto", media_total)
-    col5.metric("Mediana total contacto", mediana_total)
+    col5.metric("Media total contacto", media_total)
+    col6.metric("Mediana total contacto", mediana_total)
+
+    if uploaded_notes is not None:
+        with st.expander("🔎 Debug notas de preferencia detectadas desde el Excel de notas"):
+            if len(notes_pref_df) > 0:
+                st.dataframe(
+                    notes_pref_df[
+                        [c for c in [
+                            NOTES_DEAL_ID_COL,
+                            NOTES_CONTENT_COL,
+                            "nota_texto_limpio",
+                            NOTES_CREATED_COL if NOTES_CREATED_COL in notes_pref_df.columns else None
+                        ] if c is not None]
+                    ].sort_values([NOTES_DEAL_ID_COL]),
+                    use_container_width=True
+                )
+            else:
+                st.info("No se han detectado notas de preferencia de contacto en el Excel de notas.")
 
     st.subheader(labels["title"])
     st.dataframe(res_to_show, use_container_width=True)
@@ -1195,13 +1283,15 @@ if uploaded:
     excluded_segments = res[res["excluded_segment"] == True].copy()
     if len(excluded_segments) > 0:
         st.subheader("⚠️ Tramos excluidos del cálculo")
+        cols_excluded = [
+            "deal_id", "segment_index", "segment_source", "from_owner", "to_owner",
+            "agent_owner", "segment_start", "segment_end", "exclusion_reason"
+        ]
+        if "contact_preference_text" in excluded_segments.columns:
+            cols_excluded.append("contact_preference_text")
+
         st.dataframe(
-            excluded_segments[
-                [
-                    "deal_id", "segment_index", "segment_source", "from_owner", "to_owner",
-                    "agent_owner", "segment_start", "segment_end", "exclusion_reason"
-                ]
-            ],
+            excluded_segments[cols_excluded],
             use_container_width=True
         )
 
@@ -1247,7 +1337,8 @@ if uploaded:
         debug_segments,
         debug_contact,
         debug_management,
-        debug_relevant
+        debug_relevant,
+        notes_pref_df
     )
     st.download_button(
         "⬇️ Descargar Excel con resultados",
@@ -1256,4 +1347,4 @@ if uploaded:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
-    st.info("Sube un Excel con al menos la columna 'Negocio - ID'.")
+    st.info("Sube un Excel principal con al menos la columna 'Negocio - ID'.")
