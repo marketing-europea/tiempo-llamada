@@ -1047,6 +1047,15 @@ if uploaded:
         contact_mode,
         only_direct_outgoing_after_first_assignment
     )
+    
+    total_unique_leads = df[COL_DEAL_ID].dropna().nunique()
+
+leads_first_assignment_direct_call = res[
+    (res["segment_index"] == 1) &
+    (res["direct_outgoing_after_assignment"] == True) &
+    (res["has_contact"] == True) &
+    (res["excluded_segment"] != True)
+]["deal_id"].dropna().nunique()
 
     res_to_show = res.copy()
     res_to_show = res_to_show[res_to_show["excluded_segment"] != True].copy()
@@ -1054,13 +1063,25 @@ if uploaded:
     if hide_segments_without_contact and len(res_to_show) > 0:
         res_to_show = res_to_show[res_to_show["has_contact"] == True].copy()
 
-    col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4, col5 = st.columns(5)
+
     col1.metric(
+        "Leads únicos",
+        f"{total_unique_leads:,}".replace(",", ".")
+    )
+
+    col2.metric(
+        "Leads con llamada tras 1ª asignación",
+        f"{leads_first_assignment_direct_call:,}".replace(",", ".")
+    )
+
+    col3.metric(
         labels["metric_count"],
         f"{len(res[(res['has_contact'] == True) & (res['excluded_segment'] != True)]):,}".replace(",", ".")
     )
-    col2.metric("Media total contacto", media_total)
-    col3.metric("Mediana total contacto", mediana_total)
+
+    col4.metric("Media total contacto", media_total)
+    col5.metric("Mediana total contacto", mediana_total)
 
     st.subheader(labels["title"])
     st.dataframe(res_to_show, use_container_width=True)
