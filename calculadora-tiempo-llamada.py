@@ -67,6 +67,12 @@ def to_madrid_ts(value):
 
 
 def get_activity_datetime_local(activity_data: dict) -> pd.Timestamp:
+    for field in ["marked_as_done_time", "add_time", "timestamp", "update_time"]:
+        value = activity_data.get(field)
+        ts = to_madrid_ts(value)
+        if pd.notna(ts):
+            return ts
+
     due_date = clean_text(activity_data.get("due_date"))
     due_time = clean_text(activity_data.get("due_time"))
 
@@ -79,12 +85,6 @@ def get_activity_datetime_local(activity_data: dict) -> pd.Timestamp:
         dt_utc = pd.to_datetime(f"{due_date} 00:00:00", errors="coerce", utc=True)
         if pd.notna(dt_utc):
             return dt_utc.tz_convert(LOCAL_TIMEZONE).tz_localize(None)
-
-    for field in ["marked_as_done_time", "add_time", "update_time", "timestamp"]:
-        value = activity_data.get(field)
-        ts = to_madrid_ts(value)
-        if pd.notna(ts):
-            return ts
 
     return pd.NaT
 
