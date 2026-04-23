@@ -679,7 +679,7 @@ def compute_from_flow(
         has_contact_preference = False
         contact_preference_text = ""
 
-        for item in flow_json.get("data", []) or []:
+    for item in flow_json.get("data", []) or []:
         obj = clean_text(item.get("object")).lower()
         data = item.get("data", {}) or {}
 
