@@ -34,6 +34,11 @@ hide_segments_without_contact = st.checkbox(
     value=False
 )
 
+only_direct_outgoing_after_first_assignment = st.checkbox(
+    "Analizar solo tramos donde tras la asignación el primer evento relevante es una llamada saliente",
+    value=False
+)
+
 st.subheader("🔐 Configuración API Pipedrive")
 api_token = st.text_input("API token", type="password")
 company_domain = st.text_input("Subdominio de Pipedrive", placeholder="tuempresa")
@@ -137,6 +142,25 @@ def get_result_labels(selected_mode: str):
         "time_col": "tiempo_hasta_primer_contacto",
         "download_name": "primera_gestion_y_contacto_por_asignacion_flow.xlsx",
     }
+
+
+def classify_activity(subject: str, type_name: str, activity_type: str) -> str:
+    text = f"{clean_text(subject)} {clean_text(type_name)} {clean_text(activity_type)}".lower()
+
+    if "llamada saliente" in text:
+        return "outgoing_call"
+    if "whatsapp chat" in text:
+        return "whatsapp"
+    if (
+        "recordatorio agente" in text
+        or "lead pendiente de llamar" in text
+        or "llamada de seguimiento" in text
+        or "recordatorio" in text
+        or "pendiente de llamar" in text
+    ):
+        return "management_other"
+
+    return ""
 
 
 def extract_created_time_from_flow(flow_json: dict, fallback_created: pd.Timestamp) -> pd.Timestamp:
@@ -342,6 +366,49 @@ def extract_flow_management_activities(flow_json: dict) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("activity_time").reset_index(drop=True)
 
 
+def extract_flow_relevant_activities(flow_json: dict) -> pd.DataFrame:
+    rows = []
+
+    for item in flow_json.get("data", []) or []:
+        if item.get("object") != "activity":
+            continue
+
+        data = item.get("data", {}) or {}
+        subject = clean_text(data.get("subject"))
+        type_name = clean_text(data.get("type_name"))
+        activity_type = clean_text(data.get("type"))
+
+        activity_class = classify_activity(subject, type_name, activity_type)
+        if not activity_class:
+            continue
+
+        activity_time = get_activity_datetime_local(data)
+        if pd.isna(activity_time):
+            continue
+
+        rows.append({
+            "activity_time": activity_time,
+            "activity_subject": subject,
+            "activity_id": data.get("id"),
+            "activity_type": activity_type,
+            "type_name": type_name,
+            "activity_done": data.get("done"),
+            "owner_name": clean_text(data.get("owner_name")),
+            "assigned_to_user_id": data.get("assigned_to_user_id"),
+            "user_id": data.get("user_id"),
+            "activity_class": activity_class,
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "activity_time", "activity_subject", "activity_id", "activity_type",
+            "type_name", "activity_done", "owner_name", "assigned_to_user_id",
+            "user_id", "activity_class"
+        ])
+
+    return pd.DataFrame(rows).sort_values("activity_time").reset_index(drop=True)
+
+
 def build_assignment_segments(
     deal_id: int,
     deal_created: pd.Timestamp,
@@ -498,13 +565,19 @@ def build_agent_dual_summary(df_management: pd.DataFrame, df_contact: pd.DataFra
     return out.sort_values("agent_owner", na_position="last").reset_index(drop=True)
 
 
-def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_mode: str):
+def compute_from_flow(
+    deals_df: pd.DataFrame,
+    apply_filter_1day: bool,
+    selected_mode: str,
+    only_direct_outgoing_after_first_assignment: bool
+):
     labels = get_result_labels(selected_mode)
 
     rows = []
     debug_segments = []
     debug_contact_activities = []
     debug_management_activities = []
+    debug_relevant_activities = []
 
     deal_ids = (
         pd.to_numeric(deals_df[COL_DEAL_ID], errors="coerce")
@@ -543,6 +616,10 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                 "segment_start_adjusted": pd.NaT,
                 "segment_end": pd.NaT,
                 "effective_start": pd.NaT,
+                "first_relevant_activity_time": pd.NaT,
+                "first_relevant_activity_subject": "",
+                "first_relevant_activity_class": "",
+                "direct_outgoing_after_assignment": False,
                 "first_management_time": pd.NaT,
                 "first_management_subject": "",
                 "delta_sec_management": float("nan"),
@@ -564,6 +641,7 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
         stage_changes_from_lead = extract_stage_changes_from_lead(flow_json)
         flow_contact_activities = extract_flow_contact_activities(flow_json, selected_mode)
         flow_management_activities = extract_flow_management_activities(flow_json)
+        flow_relevant_activities = extract_flow_relevant_activities(flow_json)
 
         segments = build_assignment_segments(
             deal_id=deal_id,
@@ -591,12 +669,20 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
             m_dbg["deal_id"] = deal_id
             debug_management_activities.append(m_dbg)
 
+        if not flow_relevant_activities.empty:
+            r_dbg = flow_relevant_activities.copy()
+            if not segments.empty:
+                r_dbg = assign_owner_to_flow_activities(r_dbg, segments)
+            r_dbg["deal_id"] = deal_id
+            debug_relevant_activities.append(r_dbg)
+
         if segments.empty:
             progress.progress(i / total if total else 1)
             continue
 
         flow_contact_activities = assign_owner_to_flow_activities(flow_contact_activities, segments)
         flow_management_activities = assign_owner_to_flow_activities(flow_management_activities, segments)
+        flow_relevant_activities = assign_owner_to_flow_activities(flow_relevant_activities, segments)
 
         for seg_idx, seg in segments.iterrows():
             segment_start = seg["segment_start"]
@@ -626,6 +712,30 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                 first_stage_change_in_segment = first_stage_row["stage_change_time"]
                 first_stage_old = first_stage_row["old_stage"]
                 first_stage_new = first_stage_row["new_stage"]
+
+            relevant_candidate = flow_relevant_activities[
+                (flow_relevant_activities["real_owner"] == agent_owner) &
+                (flow_relevant_activities["activity_time"] >= effective_start)
+            ].copy()
+
+            if pd.notna(segment_end):
+                relevant_candidate = relevant_candidate[
+                    relevant_candidate["activity_time"] < segment_end
+                ].copy()
+
+            relevant_candidate = relevant_candidate.sort_values(["activity_time", "activity_subject"])
+
+            first_relevant_activity_time = pd.NaT
+            first_relevant_activity_subject = ""
+            first_relevant_activity_class = ""
+            direct_outgoing_after_assignment = False
+
+            if not relevant_candidate.empty:
+                first_relevant = relevant_candidate.iloc[0]
+                first_relevant_activity_time = first_relevant["activity_time"]
+                first_relevant_activity_subject = first_relevant["activity_subject"]
+                first_relevant_activity_class = first_relevant["activity_class"]
+                direct_outgoing_after_assignment = first_relevant_activity_class == "outgoing_call"
 
             management_candidate = flow_management_activities[
                 (flow_management_activities["real_owner"] == agent_owner) &
@@ -679,6 +789,10 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                         "segment_start_adjusted": segment_start_adjusted,
                         "segment_end": segment_end,
                         "effective_start": effective_start,
+                        "first_relevant_activity_time": first_relevant_activity_time,
+                        "first_relevant_activity_subject": first_relevant_activity_subject,
+                        "first_relevant_activity_class": first_relevant_activity_class,
+                        "direct_outgoing_after_assignment": direct_outgoing_after_assignment,
                         "first_management_time": first_management_time,
                         "first_management_subject": first_management_subject,
                         "delta_sec_management": delta_sec_management,
@@ -705,6 +819,10 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                     "segment_start_adjusted": segment_start_adjusted,
                     "segment_end": segment_end,
                     "effective_start": effective_start,
+                    "first_relevant_activity_time": first_relevant_activity_time,
+                    "first_relevant_activity_subject": first_relevant_activity_subject,
+                    "first_relevant_activity_class": first_relevant_activity_class,
+                    "direct_outgoing_after_assignment": direct_outgoing_after_assignment,
                     "first_management_time": first_management_time,
                     "first_management_subject": first_management_subject,
                     "delta_sec_management": delta_sec_management,
@@ -736,6 +854,10 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                     "segment_start_adjusted": segment_start_adjusted,
                     "segment_end": segment_end,
                     "effective_start": effective_start,
+                    "first_relevant_activity_time": first_relevant_activity_time,
+                    "first_relevant_activity_subject": first_relevant_activity_subject,
+                    "first_relevant_activity_class": first_relevant_activity_class,
+                    "direct_outgoing_after_assignment": direct_outgoing_after_assignment,
                     "first_management_time": first_management_time,
                     "first_management_subject": first_management_subject,
                     "delta_sec_management": delta_sec_management,
@@ -767,6 +889,10 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
                 "segment_start_adjusted": segment_start_adjusted,
                 "segment_end": segment_end,
                 "effective_start": effective_start,
+                "first_relevant_activity_time": first_relevant_activity_time,
+                "first_relevant_activity_subject": first_relevant_activity_subject,
+                "first_relevant_activity_class": first_relevant_activity_class,
+                "direct_outgoing_after_assignment": direct_outgoing_after_assignment,
                 "first_management_time": first_management_time,
                 "first_management_subject": first_management_subject,
                 "delta_sec_management": delta_sec_management,
@@ -793,6 +919,7 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
             pd.DataFrame(),
             pd.DataFrame(),
             pd.DataFrame(),
+            pd.DataFrame(),
             labels,
         )
 
@@ -801,6 +928,12 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
 
     if apply_filter_1day:
         res = res[(res["delta_sec"].isna()) | (res["delta_sec"] < ONE_DAY_SECONDS)].copy()
+
+    if only_direct_outgoing_after_first_assignment:
+        res = res[
+            (res["segment_index"] == 1) &
+            (res["direct_outgoing_after_assignment"] == True)
+        ].copy()
 
     res["tiempo_hasta_primera_gestion"] = res["delta_sec_management"].apply(format_duration_exact)
 
@@ -843,6 +976,7 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
     debug_segments_df = pd.concat(debug_segments, ignore_index=True) if debug_segments else pd.DataFrame()
     debug_contact_df = pd.concat(debug_contact_activities, ignore_index=True) if debug_contact_activities else pd.DataFrame()
     debug_management_df = pd.concat(debug_management_activities, ignore_index=True) if debug_management_activities else pd.DataFrame()
+    debug_relevant_df = pd.concat(debug_relevant_activities, ignore_index=True) if debug_relevant_activities else pd.DataFrame()
 
     return (
         res,
@@ -852,6 +986,7 @@ def compute_from_flow(deals_df: pd.DataFrame, apply_filter_1day: bool, selected_
         debug_segments_df,
         debug_contact_df,
         debug_management_df,
+        debug_relevant_df,
         labels,
     )
 
@@ -861,7 +996,8 @@ def to_excel_bytes(
     agent_summary: pd.DataFrame,
     debug_segments: pd.DataFrame,
     debug_contact: pd.DataFrame,
-    debug_management: pd.DataFrame
+    debug_management: pd.DataFrame,
+    debug_relevant: pd.DataFrame
 ) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -874,6 +1010,8 @@ def to_excel_bytes(
             debug_contact.to_excel(writer, index=False, sheet_name="debug_contacto_flow")
         if len(debug_management) > 0:
             debug_management.to_excel(writer, index=False, sheet_name="debug_gestion_flow")
+        if len(debug_relevant) > 0:
+            debug_relevant.to_excel(writer, index=False, sheet_name="debug_eventos_relevantes")
     return output.getvalue()
 
 
@@ -901,11 +1039,13 @@ if uploaded:
         debug_segments,
         debug_contact,
         debug_management,
+        debug_relevant,
         labels,
     ) = compute_from_flow(
         df,
         apply_filter_1day,
-        contact_mode
+        contact_mode,
+        only_direct_outgoing_after_first_assignment
     )
 
     res_to_show = res.copy()
@@ -983,12 +1123,22 @@ if uploaded:
         else:
             st.info("No hay actividades de gestión para mostrar.")
 
+    with st.expander("🔎 Debug primer evento relevante tras asignación"):
+        if len(debug_relevant) > 0:
+            st.dataframe(
+                debug_relevant.sort_values(["deal_id", "activity_time"]),
+                use_container_width=True
+            )
+        else:
+            st.info("No hay eventos relevantes para mostrar.")
+
     xlsx_bytes = to_excel_bytes(
         res,
         agent_summary,
         debug_segments,
         debug_contact,
-        debug_management
+        debug_management,
+        debug_relevant
     )
     st.download_button(
         "⬇️ Descargar Excel con resultados",
