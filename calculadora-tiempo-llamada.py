@@ -677,17 +677,28 @@ def compute_from_flow(
         )
 
         has_contact_preference = False
+        contact_preference_text = ""
+
         for item in flow_json.get("data", []) or []:
-            if item.get("object") != "activity":
-                continue
-            data = item.get("data", {}) or {}
-            subject = clean_text(data.get("subject"))
-            type_name = clean_text(data.get("type_name"))
-            activity_type = clean_text(data.get("type"))
-            text = f"{subject} {type_name} {activity_type}"
-            if is_contact_preference_note(text):
-                has_contact_preference = True
-                break
+        obj = clean_text(item.get("object")).lower()
+        data = item.get("data", {}) or {}
+
+        candidate_texts = [
+        clean_text(data.get("subject")),
+        clean_text(data.get("content")),
+        clean_text(data.get("note")),
+        clean_text(data.get("title")),
+        clean_text(data.get("type_name")),
+        clean_text(data.get("type")),
+        clean_text(data.get("description")),
+    ]
+
+        full_text = " | ".join([t for t in candidate_texts if t])
+
+    if is_contact_preference_note(full_text):
+        has_contact_preference = True
+        contact_preference_text = full_text
+        break
 
         if not segments.empty:
             seg_dbg = segments.copy()
