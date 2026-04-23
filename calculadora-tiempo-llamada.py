@@ -1063,7 +1063,7 @@ if uploaded:
     if hide_segments_without_contact and len(res_to_show) > 0:
         res_to_show = res_to_show[res_to_show["has_contact"] == True].copy()
 
-        col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     col1.metric(
         "Leads únicos",
