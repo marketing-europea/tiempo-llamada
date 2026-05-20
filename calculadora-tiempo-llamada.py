@@ -9,6 +9,440 @@ st.set_page_config(
     layout="wide"
 )
 
+# ============================================================
+# NAVEGACIÓN
+# ============================================================
+
+vista = st.sidebar.radio(
+    "Apartado",
+    ["Ayuda y documentación", "Análisis"],
+    index=0
+)
+
+# ============================================================
+# AYUDA
+# ============================================================
+
+if vista == "Ayuda y documentación":
+    st.title("Ayuda y documentación")
+
+    st.info(
+        "Esta pantalla se puede consultar sin subir archivos ni introducir la API Key. "
+        "Primero revisa cómo funciona la app y después entra en el apartado Análisis."
+    )
+
+    st.markdown("""
+    ## ¿Para qué sirve esta app?
+
+    Esta aplicación analiza la **primera gestión** y el **primer contacto** realizados sobre un negocio de Pipedrive después de cada asignación real a un propietario.
+
+    La app usa el **Flow API de Pipedrive** como fuente principal para reconstruir:
+
+    - Cambios de propietario.
+    - Reasignaciones reales.
+    - Cambios de estado.
+    - Cambios de etapa.
+    - Actividades.
+    - Llamadas.
+    - WhatsApps, si están registrados como actividad o evento detectable.
+    - Primer contacto después de cada asignación.
+
+    El objetivo es medir cuánto tarda cada agente en gestionar o contactar un lead desde que se le asigna.
+
+    ---
+
+    ## Archivos necesarios
+
+    ### 1. Excel principal de negocios
+
+    Es obligatorio para hacer el análisis.
+
+    Campo de subida:
+
+    **Sube tu Excel principal (.xlsx)**
+
+    Debe contener, como mínimo:
+
+    - **Negocio - ID**
+    - **Negocio - Negocio creado el**
+
+    El campo más importante es:
+
+    ```text
+    Negocio - ID
+    ```
+
+    porque se usa para consultar el flow de cada negocio en Pipedrive.
+
+    ---
+
+    ### 2. Excel de notas de Pipedrive
+
+    Es opcional.
+
+    Campo de subida:
+
+    **Sube el Excel de notas (.xlsx) - opcional**
+
+    Sirve para excluir leads que tengan notas de preferencia de contacto.
+
+    Columnas esperadas:
+
+    - **Nota - ID de negocio**
+    - **Nota - Contenido**
+    - **Nota - Añadir hora**
+
+    Este archivo se usa especialmente cuando activas:
+
+    **Excluir leads que tienen nota de preferencia de contacto en el Excel de notas**
+
+    ---
+
+    ## Configuración API Pipedrive
+
+    Para funcionar, la app necesita:
+
+    ### API token
+
+    Es el token personal de Pipedrive.
+
+    Se introduce en:
+
+    **API token**
+
+    ### Subdominio de Pipedrive
+
+    Es la parte inicial de la URL de Pipedrive.
+
+    Ejemplo:
+
+    Si tu URL es:
+
+    ```text
+    https://miempresa.pipedrive.com
+    ```
+
+    el subdominio es:
+
+    ```text
+    miempresa
+    ```
+
+    No debes poner `https://` ni `.pipedrive.com`.
+
+    ---
+
+    ## Lógica del análisis
+
+    La app no se basa solo en el Excel.
+
+    El Excel sirve para obtener los IDs de negocio, pero la reconstrucción real se hace llamando al **Flow API de Pipedrive**.
+
+    Para cada negocio, la app consulta su historial y reconstruye la secuencia temporal de eventos.
+
+    Después identifica:
+
+    1. Cuándo se creó el negocio.
+    2. A qué propietario se asignó inicialmente.
+    3. Si hubo cambios de propietario.
+    4. Cuándo empieza cada tramo de asignación.
+    5. Qué eventos ocurren después de cada asignación.
+    6. Cuál fue la primera gestión.
+    7. Cuál fue el primer contacto.
+    8. Cuánto tiempo pasó desde la asignación hasta ese evento.
+
+    ---
+
+    ## Qué es un tramo de asignación
+
+    Un tramo de asignación es el periodo durante el cual un negocio pertenece a un propietario concreto.
+
+    Por ejemplo:
+
+    - El negocio se asigna a Agente A a las 10:00.
+    - A las 12:00 se reasigna a Agente B.
+
+    Entonces hay dos tramos:
+
+    - Tramo 1: Agente A, desde las 10:00 hasta las 12:00.
+    - Tramo 2: Agente B, desde las 12:00 en adelante.
+
+    La app mide la primera gestión/contacto dentro de cada tramo.
+
+    ---
+
+    ## Qué mide la app
+
+    ### Primera gestión
+
+    Es el primer evento relevante detectado después de la asignación.
+
+    Puede incluir actividades, cambios o acciones registradas en el flow.
+
+    ### Primer contacto
+
+    Depende del modo seleccionado:
+
+    #### Primera llamada saliente
+
+    Solo considera llamadas salientes como contacto válido.
+
+    #### Primer contacto (llamada + WhatsApp)
+
+    Considera como contacto válido:
+
+    - Llamada saliente.
+    - WhatsApp, si aparece registrado y detectable.
+
+    ---
+
+    ## Opciones disponibles
+
+    ### Qué quieres medir como contacto
+
+    Puedes elegir entre:
+
+    - **Primera llamada saliente**
+    - **Primer contacto (llamada + WhatsApp)**
+
+    Usa la primera opción si quieres una métrica estrictamente telefónica.
+
+    Usa la segunda si quieres medir contacto comercial más amplio.
+
+    ---
+
+    ### Excluir tramos cuyo primer contacto tarde 1 día o más
+
+    Si activas esta opción, la app elimina tramos donde el primer contacto tarda al menos 24 horas.
+
+    Sirve para analizar solo contactos relativamente rápidos.
+
+    ---
+
+    ### Ocultar tramos sin contacto
+
+    Si activas esta opción, se ocultan los tramos en los que no se detecta contacto.
+
+    Sirve para limpiar la tabla final cuando solo quieres revisar tramos con gestión efectiva.
+
+    ---
+
+    ### Analizar solo tramos donde tras la asignación el primer evento relevante es una llamada saliente
+
+    Esta opción es más restrictiva.
+
+    Solo mantiene tramos donde la primera acción relevante después de la asignación es una llamada saliente.
+
+    Sirve para comprobar si el agente llama directamente tras recibir el lead.
+
+    ---
+
+    ### Excluir leads que tienen nota de preferencia de contacto
+
+    Esta opción usa el Excel de notas.
+
+    Excluye negocios que tengan notas donde se indique una preferencia de contacto.
+
+    Es útil porque algunos leads pueden pedir ser contactados en otro momento o por otro canal, y eso puede distorsionar la métrica de rapidez.
+
+    ---
+
+    ## Tolerancia para cambios de propietario
+
+    La app usa una tolerancia interna:
+
+    ```python
+    OWNER_CHANGE_TOLERANCE_SECONDS = 60
+    ```
+
+    Esto significa que eventos muy próximos a un cambio de propietario pueden tratarse como parte del mismo momento de asignación.
+
+    Sirve para evitar errores cuando Pipedrive registra varios eventos casi simultáneos.
+
+    ---
+
+    ## Regla de 1 día
+
+    La app define:
+
+    ```python
+    ONE_DAY_SECONDS = 86400
+    ```
+
+    Es decir:
+
+    ```text
+    1 día = 86.400 segundos
+    ```
+
+    Esta constante se usa cuando activas el filtro de excluir tramos cuyo contacto tarda 1 día o más.
+
+    ---
+
+    ## Resultado esperado
+
+    El análisis debería devolver una tabla con información como:
+
+    - ID del negocio.
+    - Fecha de creación.
+    - Propietario asignado.
+    - Momento de asignación.
+    - Primer evento relevante.
+    - Primer contacto.
+    - Tipo de contacto.
+    - Tiempo hasta primera gestión.
+    - Tiempo hasta primer contacto.
+    - Si hubo llamada saliente.
+    - Si hubo WhatsApp.
+    - Si el tramo cumple los filtros seleccionados.
+
+    ---
+
+    ## Uso recomendado
+
+    1. Entra primero en **Ayuda y documentación**.
+    2. Revisa qué archivos necesitas.
+    3. Ve al apartado **Análisis**.
+    4. Sube el Excel principal de negocios.
+    5. Sube el Excel de notas si vas a usar el filtro de preferencias.
+    6. Introduce API token y subdominio.
+    7. Selecciona qué quieres medir como contacto.
+    8. Activa o desactiva filtros.
+    9. Ejecuta el análisis.
+    10. Revisa la tabla final y descarga resultados si la app lo permite.
+
+    ---
+
+    ## Problemas frecuentes
+
+    ### La API no devuelve datos
+
+    Revisa que:
+
+    - El API token sea correcto.
+    - El subdominio esté bien escrito.
+    - El negocio exista en Pipedrive.
+    - El usuario tenga permisos para ver ese negocio.
+
+    ### No aparecen contactos
+
+    Puede ocurrir si:
+
+    - No hay llamadas registradas en el flow.
+    - WhatsApp no queda registrado como actividad detectable.
+    - El contacto ocurrió antes de la asignación.
+    - El contacto ocurrió en otro sistema externo no reflejado en Pipedrive.
+
+    ### Hay muchos tramos sin contacto
+
+    Puede indicar:
+
+    - Leads reasignados sin gestión posterior.
+    - Actividad comercial registrada fuera de Pipedrive.
+    - Errores de registro.
+    - Negocios cerrados sin llamada.
+    - Contactos realizados por canales no detectables.
+
+    ### El Excel de notas no filtra nada
+
+    Revisa que tenga estas columnas:
+
+    - **Nota - ID de negocio**
+    - **Nota - Contenido**
+    - **Nota - Añadir hora**
+
+    ---
+
+    ## Dependencias necesarias
+
+    En `requirements.txt` incluye:
+
+    ```text
+    streamlit
+    pandas
+    requests
+    openpyxl
+    ```
+    """)
+
+    st.stop()
+
+
+# ============================================================
+# APP PRINCIPAL
+# ============================================================
+
+st.title("📞 Primera gestión y contacto por asignación usando Flow de Pipedrive")
+
+st.write(
+    "Sube un Excel principal con los negocios a analizar. "
+    "Opcionalmente, puedes subir también un Excel de notas exportado de Pipedrive. "
+    "La app usa el flow API de Pipedrive como fuente de verdad para reconstruir "
+    "reasignaciones, estados, etapas y actividades, y calcula la primera gestión "
+    "y el primer contacto tras cada asignación real."
+)
+
+uploaded = st.file_uploader("Sube tu Excel principal (.xlsx)", type=["xlsx"])
+
+uploaded_notes = st.file_uploader(
+    "Sube el Excel de notas (.xlsx) - opcional",
+    type=["xlsx"],
+    key="notes_file"
+)
+
+contact_mode = st.radio(
+    "Qué quieres medir como contacto",
+    ["Primera llamada saliente", "Primer contacto (llamada + WhatsApp)"],
+    horizontal=True,
+)
+
+apply_filter_1day = st.checkbox(
+    "Excluir tramos cuyo primer contacto tarde 1 día o más",
+    value=False
+)
+
+hide_segments_without_contact = st.checkbox(
+    "Ocultar tramos sin contacto",
+    value=False
+)
+
+only_direct_outgoing_after_first_assignment = st.checkbox(
+    "Analizar solo tramos donde tras la asignación el primer evento relevante es una llamada saliente",
+    value=False
+)
+
+exclude_contact_preference_notes = st.checkbox(
+    "Excluir leads que tienen nota de preferencia de contacto en el Excel de notas",
+    value=False
+)
+
+st.subheader("🔐 Configuración API Pipedrive")
+
+api_token = st.text_input("API token", type="password")
+
+company_domain = st.text_input(
+    "Subdominio de Pipedrive",
+    placeholder="tuempresa"
+)
+
+COL_DEAL_ID = "Negocio - ID"
+COL_CREATED = "Negocio - Negocio creado el"
+
+NOTES_DEAL_ID_COL = "Nota - ID de negocio"
+NOTES_CONTENT_COL = "Nota - Contenido"
+NOTES_CREATED_COL = "Nota - Añadir hora"
+
+ONE_DAY_SECONDS = 86400
+OWNER_CHANGE_TOLERANCE_SECONDS = 60
+
+# A partir de aquí pega el resto de tu código original:
+# - funciones auxiliares
+# - lectura del Excel
+# - llamadas a Pipedrive
+# - reconstrucción del flow
+# - análisis de tramos
+# - tablas/resultados/descargas
+
 st.title("📞 Primera gestión y contacto por asignación usando Flow de Pipedrive")
 st.write(
     "Sube un Excel principal con los negocios a analizar. "
