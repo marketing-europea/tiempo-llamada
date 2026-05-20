@@ -382,12 +382,16 @@ st.write(
     "y el primer contacto tras cada asignación real."
 )
 
-uploaded = st.file_uploader("Sube tu Excel principal (.xlsx)", type=["xlsx"])
+uploaded = st.file_uploader(
+    "Sube tu Excel principal (.xlsx)",
+    type=["xlsx"],
+    key="excel_principal"
+)
 
 uploaded_notes = st.file_uploader(
     "Sube el Excel de notas (.xlsx) - opcional",
     type=["xlsx"],
-    key="notes_file"
+    key="excel_notas"
 )
 
 contact_mode = st.radio(
@@ -451,9 +455,6 @@ st.write(
     "reasignaciones, estados, etapas y actividades, y calcula la primera gestión "
     "y el primer contacto tras cada asignación real."
 )
-
-uploaded = st.file_uploader("Sube tu Excel principal (.xlsx)", type=["xlsx"])
-uploaded_notes = st.file_uploader("Sube el Excel de notas (.xlsx) - opcional", type=["xlsx"], key="notes_file")
 
 contact_mode = st.radio(
     "Qué quieres medir como contacto",
